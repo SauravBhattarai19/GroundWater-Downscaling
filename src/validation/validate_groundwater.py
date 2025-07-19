@@ -60,8 +60,6 @@ class GroundwaterValidator:
         # Try multiple possible filenames in order of preference
         possible_files = [
             "results/groundwater_storage_anomalies.nc",
-            "results/groundwater_storage_anomalies_corrected.nc", 
-            "results/groundwater_storage_anomalies_enhanced.nc"
         ]
         
         for file_path in possible_files:
@@ -107,8 +105,10 @@ class GroundwaterValidator:
         except Exception as e:
             raise RuntimeError(f"Failed to load groundwater data: {e}")
         
-        # Load well observations
-        well_data_path = "data/raw/usgs_well_data/monthly_groundwater_anomalies.csv"
+        # Load well observations (try new format first)
+        well_data_path = "data/raw/usgs_well_data/monthly_groundwater_anomalies_cm.csv"
+        if not os.path.exists(well_data_path):
+            well_data_path = "data/raw/usgs_well_data/monthly_groundwater_anomalies.csv"
         well_metadata_path = "data/raw/usgs_well_data/well_metadata.csv"
         
         try:
@@ -277,15 +277,13 @@ class GroundwaterValidator:
         return (lat >= lat_min - tolerance and lat <= lat_max + tolerance and
                 lon >= lon_min - tolerance and lon <= lon_max + tolerance)
     
-    def validate_point_to_point(self, specific_yield_range=[0.10, 0.15, 0.20, 0.25]):
+    def validate_point_to_point(self):
         """
-        Validate groundwater predictions against individual wells.
+        Simplified validation using pre-converted storage anomalies.
         
-        Parameters:
-        -----------
-        specific_yield_range : list
-            Range of specific yield values to test for optimal correlation
-            
+        Uses pre-converted storage anomaly data (cm) if available, otherwise
+        converts depth anomalies using standard specific yield (0.15).
+        
         Returns:
         --------
         pd.DataFrame
@@ -302,6 +300,10 @@ class GroundwaterValidator:
             'sufficient_data': 0,
             'validated': 0
         }
+        
+        # Determine if data is already in storage units
+        well_data_path = "data/raw/usgs_well_data/monthly_groundwater_anomalies_cm.csv"
+        data_in_storage_units = os.path.exists(well_data_path)
         
         for idx, well in tqdm(self.well_locations.iterrows(), 
                              total=len(self.well_locations),
@@ -333,30 +335,28 @@ class GroundwaterValidator:
                     continue
                 processing_stats['sufficient_data'] += 1
                 
-                # Test different specific yields to find optimal correlation
-                best_metrics = None
-                best_correlation = -999
+                # Convert to storage anomalies if needed
+                if data_in_storage_units:
+                    # Data already converted to storage anomalies in cm
+                    well_storage = well_obs  # No conversion needed!
+                    specific_yield_used = 0.15  # Standard value from metadata
+                else:
+                    # Legacy data in depth units - use standard specific yield
+                    STANDARD_SPECIFIC_YIELD = 0.15  # From literature
+                    well_storage = well_obs * STANDARD_SPECIFIC_YIELD * 100
+                    specific_yield_used = STANDARD_SPECIFIC_YIELD
                 
-                for sy in specific_yield_range:
-                    # Convert depth to groundwater storage
-                    # Well data is depth to water (m), convert to storage anomaly (cm)
-                    well_storage = well_obs * sy * 100  # sy * 100 cm/m
-                    
-                    # Calculate metrics
-                    metrics = self._calculate_metrics(gws_at_well, well_storage)
-                    
-                    if metrics and metrics['pearson_r'] > best_correlation:
-                        best_correlation = metrics['pearson_r']
-                        best_metrics = metrics.copy()
-                        best_metrics['specific_yield'] = sy
+                # Calculate metrics directly
+                metrics = self._calculate_metrics(gws_at_well, well_storage)
                 
-                if best_metrics:
-                    best_metrics.update({
+                if metrics:
+                    metrics.update({
                         'well_id': well_id,
                         'lat': lat,
-                        'lon': lon
+                        'lon': lon,
+                        'specific_yield': specific_yield_used
                     })
-                    results.append(best_metrics)
+                    results.append(metrics)
                     processing_stats['validated'] += 1
                     
             except Exception as e:
@@ -441,39 +441,45 @@ class GroundwaterValidator:
                     
                     if len(nearby_idx) < 3:  # Need at least 3 wells
                         continue
+                         # Get well IDs for nearby wells
+                nearby_wells = self.well_locations.iloc[nearby_idx]
+                well_ids = [str(wid) for wid in nearby_wells['well_id']]
+                
+                # Filter to wells with actual data
+                valid_wells = [w for w in well_ids if w in self.well_data.columns]
+                
+                if len(valid_wells) < 3:
+                    continue
+                
+                try:
+                    # Get GWS at grid point
+                    gws_series = self.gws_ds.groundwater.isel(lat=i, lon=j)
                     
-                    # Get well IDs for nearby wells
-                    nearby_wells = self.well_locations.iloc[nearby_idx]
-                    well_ids = [str(wid) for wid in nearby_wells['well_id']]
-                    
-                    # Filter to wells with actual data
-                    valid_wells = [w for w in well_ids if w in self.well_data.columns]
-                    
-                    if len(valid_wells) < 3:
-                        continue
-                    
-                    try:
-                        # Get GWS at grid point
-                        gws_series = self.gws_ds.groundwater.isel(lat=i, lon=j)
-                        
-                        # Average well data (using fixed specific yield of 0.15)
+                    # Average well data - check if already in storage units
+                    well_data_path = "data/raw/usgs_well_data/monthly_groundwater_anomalies_cm.csv"
+                    if os.path.exists(well_data_path):
+                        # Data already in cm storage units
+                        well_subset = self.well_data[valid_wells]
+                        well_mean = well_subset.mean(axis=1)
+                    else:
+                        # Legacy data - convert using standard specific yield
                         well_subset = self.well_data[valid_wells]
                         well_mean = well_subset.mean(axis=1) * 0.15 * 100  # Convert to cm
+                    
+                    # Calculate metrics
+                    metrics = self._calculate_metrics(gws_series, well_mean)
+                    
+                    if metrics:
+                        metrics.update({
+                            'lat': lat,
+                            'lon': lon,
+                            'n_wells': len(valid_wells),
+                            'radius_km': radius_km
+                        })
+                        results.append(metrics)
                         
-                        # Calculate metrics
-                        metrics = self._calculate_metrics(gws_series, well_mean)
-                        
-                        if metrics:
-                            metrics.update({
-                                'lat': lat,
-                                'lon': lon,
-                                'n_wells': len(valid_wells),
-                                'radius_km': radius_km
-                            })
-                            results.append(metrics)
-                            
-                    except Exception as e:
-                        continue
+                except Exception as e:
+                    continue
         
         # Create results DataFrame
         metrics_df = pd.DataFrame(results)

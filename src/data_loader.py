@@ -253,8 +253,8 @@ def download_usgs_well_data():
                     # Aggregate to monthly (any measurement per month)
                     monthly = df.set_index('datetime')['depth_m'].resample('MS').mean().dropna()
                     
-                    # Quality control: need at least 12 months total
-                    if len(monthly) < 12:
+                    # Quality control: need at least 36 months total (improved from 12)
+                    if len(monthly) < 36:
                         if show_details: print(f"      Insufficient data: {len(monthly)} months")
                         debug_stats['insufficient_total_data'] += 1
                         continue
@@ -264,16 +264,23 @@ def download_usgs_well_data():
                     ref_end = pd.to_datetime(REFERENCE_END)
                     reference_data = monthly[(monthly.index >= ref_start) & (monthly.index <= ref_end)]
                     
-                    # Need at least 6 months in reference period
-                    if len(reference_data) < 6:
+                    # Need at least 24 months in reference period (improved from 6)
+                    if len(reference_data) < 24:
                         if show_details: print(f"      Insufficient reference: {len(reference_data)} months")
                         debug_stats['insufficient_reference_data'] += 1
                         continue
                     
                     # SUCCESS! Calculate anomalies
                     reference_mean = reference_data.mean()
-                    anomaly = monthly - reference_mean
-                    all_data.append(anomaly.rename(site))
+                    depth_anomaly = monthly - reference_mean  # Positive = deeper water table
+                    
+                    # Step 2: Convert to storage anomaly for GRACE comparison
+                    # Use standard specific yield of 0.15 based on literature
+                    SPECIFIC_YIELD = 0.15  # Standard value from USGS studies
+                    storage_anomaly = -depth_anomaly * SPECIFIC_YIELD * 100  # Convert to cm
+                    
+                    # Save storage anomaly instead of depth anomaly
+                    all_data.append(storage_anomaly.rename(site))
                     
                     # Save well metadata
                     site_info = info[info['site_no'] == site].iloc[0]
@@ -287,7 +294,9 @@ def download_usgs_well_data():
                         'n_months_reference': len(reference_data),
                         'reference_period': f"{REFERENCE_START}_to_{REFERENCE_END}",
                         'first_measurement': str(monthly.index[0].date()),
-                        'last_measurement': str(monthly.index[-1].date())
+                        'last_measurement': str(monthly.index[-1].date()),
+                        'specific_yield_used': SPECIFIC_YIELD,  # Add this
+                        'units': 'cm_water_equivalent'  # Add this
                     })
                     
                     state_successful += 1
@@ -339,8 +348,8 @@ def download_usgs_well_data():
     print(f"\n📋 REJECTION REASONS:")
     print(f"   No data returned: {debug_stats['no_data_returned']:,}")
     print(f"   Missing columns: {debug_stats['missing_columns']:,}")
-    print(f"   Insufficient total data (<12 months): {debug_stats['insufficient_total_data']:,}")
-    print(f"   Insufficient reference data (<6 months): {debug_stats['insufficient_reference_data']:,}")
+    print(f"   Insufficient total data (<36 months): {debug_stats['insufficient_total_data']:,}")
+    print(f"   Insufficient reference data (<24 months): {debug_stats['insufficient_reference_data']:,}")
     print(f"   API/processing errors: {debug_stats['api_errors']:,}")
     print(f"   Timeout errors: {debug_stats['timeout_errors']:,}")
 
@@ -354,7 +363,7 @@ def download_usgs_well_data():
     print("💾 Saving comprehensive well time series data...")
     combined_df = pd.concat(all_data, axis=1)
     combined_df.index.name = 'Date'
-    combined_df.to_csv(os.path.join(RAW_DIR, "usgs_well_data", "monthly_groundwater_anomalies.csv"))
+    combined_df.to_csv(os.path.join(RAW_DIR, "usgs_well_data", "monthly_groundwater_anomalies_cm.csv"))
     
     # Save comprehensive metadata
     print("💾 Saving comprehensive well metadata...")
@@ -362,10 +371,11 @@ def download_usgs_well_data():
     metadata_df.to_csv(os.path.join(RAW_DIR, "usgs_well_data", "well_metadata.csv"), index=False)
     
     print(f"\n✅ SAVED COMPREHENSIVE DATASET:")
-    print(f"   - Time series: monthly_groundwater_anomalies.csv")
+    print(f"   - Time series: monthly_groundwater_anomalies_cm.csv")
     print(f"   - Metadata: well_metadata.csv")
     print(f"   - Total wells: {len(all_data):,}")
     print(f"   - Total measurements: {combined_df.count().sum():,}")
+    print(f"   - Units: cm water equivalent storage anomaly")
     
     # Detailed state breakdown
     print(f"\n📊 WELLS BY STATE:")

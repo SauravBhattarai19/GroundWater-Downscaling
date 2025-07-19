@@ -105,7 +105,7 @@ pipeline:
   groundwater_model: "best"   # Use the best performing model
   
   # Alternative models to try if primary fails
-  fallback_models: ["rf", "xgb", "ensemble"]
+  fallback_models: ["rf", "nn","xgb", "ensemble"]
   
   # Skip model training if models already exist
   skip_training_if_exists: false

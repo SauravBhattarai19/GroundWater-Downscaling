@@ -20,6 +20,7 @@ build/
 data/raw/
 data/processed/
 data_old_bounds/
+data/usgs_well_trend/
 replacements/
 *.nc
 *.tif

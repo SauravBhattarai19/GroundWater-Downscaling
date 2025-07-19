@@ -13,6 +13,7 @@ Usage:
     python pipeline.py --models rf,xgb,lgb            # Train specific models
     python pipeline.py --single-model rf              # Use single model (legacy mode)
     python pipeline.py --ensemble-only                # Train all and use ensemble
+    python pipeline.py --validation-method annual     # Use annual trend validation
     
 Available steps:
     - download: Download satellite data from Earth Engine
@@ -35,6 +36,11 @@ Available models:
 #!/usr/bin/env python3
 import os
 import multiprocessing
+
+# Add this to pipeline.py in the imports section:
+from src.validation.validate_groundwater import main as validate_results
+from src.validation.validate_groundwater_simple import main as validate_simple
+from src.validation.validate_annual_trends import main as validate_annual_trends
 
 # Get system limits
 cpu_count = multiprocessing.cpu_count()
@@ -80,7 +86,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 # Import pipeline modules
 from data_loader import main as download_data
 from features import main as create_features
-from validation.validate_groundwater import main as validate_results
 
 # Import both old and new model training approaches
 try:
@@ -288,12 +293,18 @@ def run_groundwater_step(logger, config):
         return False
 
 
-def run_validation_step(logger):
+def run_validation_step(logger, method='simple'):
     """Validate results against wells."""
     logger.info("STEP 5: Validating against well observations...")
+    logger.info(f"Using validation method: {method}")
     
     try:
-        validate_results()
+        if method == 'simple':
+            validate_simple()
+        elif method == 'annual':
+            validate_annual_trends()
+        else:
+            validate_results()
         logger.info("✅ Validation completed successfully")
         return True
     except Exception as e:
@@ -382,6 +393,14 @@ def main():
         '--list-models',
         action='store_true',
         help='List available models and exit'
+    )
+    
+    parser.add_argument(
+        '--validation-method',
+        type=str,
+        choices=['original', 'simple', 'annual'],
+        default='simple',
+        help='Validation method to use (simple is recommended, annual for trend analysis)'
     )
     
     args = parser.parse_args()
@@ -473,7 +492,7 @@ def main():
         'train': lambda: run_train_step(logger, config, models_to_train, 
                                        args.single_model, args.ensemble_only),
         'gws': lambda: run_groundwater_step(logger, config),
-        'validate': lambda: run_validation_step(logger)
+        'validate': lambda: run_validation_step(logger, args.validation_method)
     }
     
     failed_steps = []
