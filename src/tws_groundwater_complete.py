@@ -29,7 +29,36 @@ from sklearn.preprocessing import StandardScaler
 
 
 class CompleteWaterStorageCalculator:
-    """Calculate complete TWS and groundwater with gap-filling."""
+    """
+    Calculate complete TWS and groundwater with gap-filling.
+    
+    CRITICAL LIMITATIONS AND REQUIREMENTS:
+    ====================================
+    
+    1. **Reference Period Consistency**: 
+       - TWS model and components MUST use same reference period
+       - Automatically validated during initialization
+    
+    2. **Units Consistency**:
+       - All components must be in same units (cm water equivalent)
+       - GLDAS: kg/m² → cm using 0.1 multiplier
+       - GRACE/TWS: assumed to be in cm (verify model training!)
+    
+    3. **Incomplete Water Balance**:
+       - Current equation: TWS = Soil + SWE + Groundwater
+       - Missing: Surface water, canopy storage, vegetation water
+       - "Groundwater" is actually residual water storage
+    
+    4. **Validation Required**:
+       - Always validate against independent groundwater data
+       - Check physical realism of derived values
+       - Consider regional hydrology when interpreting results
+    
+    5. **Model Training Assumptions**:
+       - ML model must be trained on consistent GRACE preprocessing
+       - Feature scaling/preprocessing must match training
+       - Model output units must match component units
+    """
     
     def __init__(self, model_path=None, reference_period=("2004-01", "2009-12")):
         """
@@ -52,6 +81,9 @@ class CompleteWaterStorageCalculator:
         self.results_dir = Path("results")
         self.results_dir.mkdir(exist_ok=True)
         
+        # CRITICAL: Verify reference period consistency
+        self._verify_reference_period_consistency()
+    
     def _find_model(self, model_path):
         """Find the trained model."""
         if model_path and Path(model_path).exists():
@@ -80,6 +112,127 @@ class CompleteWaterStorageCalculator:
                 return best_path
         
         raise FileNotFoundError("No trained model found! Run training first.")
+    
+    def _verify_reference_period_consistency(self):
+        """Verify that model and components use consistent reference periods."""
+        print("\n🔍 REFERENCE PERIOD CONSISTENCY CHECK")
+        print("="*50)
+        
+        try:
+            # Check if model file exists and load metadata
+            if self.model_path.exists():
+                model_data = joblib.load(self.model_path)
+                
+                # Check for reference period in model metadata
+                if isinstance(model_data, dict) and 'metadata' in model_data:
+                    model_ref = model_data['metadata'].get('reference_period', None)
+                    if model_ref:
+                        expected_ref = f"{self.reference_start} to {self.reference_end}"
+                        if model_ref != expected_ref:
+                            print(f"  ⚠️  REFERENCE PERIOD MISMATCH!")
+                            print(f"      Calculator: {expected_ref}")
+                            print(f"      Model: {model_ref}")
+                            print(f"  🔧 UPDATING calculator to match model reference period...")
+                            
+                            # Parse model reference period
+                            import re
+                            match = re.match(r'(\d{4}-\d{2}) to (\d{4}-\d{2})', model_ref)
+                            if match:
+                                self.reference_start = match.group(1)
+                                self.reference_end = match.group(2)
+                                print(f"  ✅ Updated to: {self.reference_start} to {self.reference_end}")
+                            else:
+                                print(f"  ❌ Could not parse model reference period: {model_ref}")
+                        else:
+                            print(f"  ✅ Reference periods MATCH: {expected_ref}")
+                    else:
+                        print(f"  ⚠️  No reference period found in model metadata")
+                        print(f"  Using calculator default: {self.reference_start} to {self.reference_end}")
+                else:
+                    print(f"  ⚠️  Legacy model format - cannot verify reference period")
+                    print(f"  Using calculator default: {self.reference_start} to {self.reference_end}")
+                    
+        except Exception as e:
+            print(f"  ❌ Error checking reference period: {e}")
+            print(f"  Using calculator default: {self.reference_start} to {self.reference_end}")
+    
+    def _validate_water_balance(self, tws_sample, soil_sample, swe_sample):
+        """Validate water balance closure and units consistency."""
+        print("\n🔬 WATER BALANCE VALIDATION")
+        print("="*40)
+        
+        # Check value ranges for physical realism
+        tws_range = (float(np.nanmin(tws_sample)), float(np.nanmax(tws_sample)))
+        soil_range = (float(np.nanmin(soil_sample)), float(np.nanmax(soil_sample)))
+        swe_range = (float(np.nanmin(swe_sample)), float(np.nanmax(swe_sample)))
+        
+        print(f"  TWS range: [{tws_range[0]:.1f}, {tws_range[1]:.1f}] cm")
+        print(f"  Soil range: [{soil_range[0]:.1f}, {soil_range[1]:.1f}] cm") 
+        print(f"  SWE range: [{swe_range[0]:.1f}, {swe_range[1]:.1f}] cm")
+        
+        # Physical realism checks
+        warnings = []
+        
+        # TWS should typically be in range [-50, 50] cm for most regions
+        if abs(tws_range[0]) > 100 or abs(tws_range[1]) > 100:
+            warnings.append(f"TWS values seem extreme: {tws_range}")
+        
+        # Soil moisture anomalies typically [-20, 20] cm
+        if abs(soil_range[0]) > 50 or abs(soil_range[1]) > 50:
+            warnings.append(f"Soil moisture anomalies seem extreme: {soil_range}")
+        
+        # SWE can be larger in snow-dominated regions
+        if swe_range[1] > 200:  # More than 2m snow water equivalent is very high
+            warnings.append(f"SWE values seem very high: {swe_range}")
+        
+        # Check for obvious unit mismatches
+        tws_magnitude = np.mean([abs(tws_range[0]), abs(tws_range[1])])
+        soil_magnitude = np.mean([abs(soil_range[0]), abs(soil_range[1])])
+        
+        if tws_magnitude > 10 * soil_magnitude or soil_magnitude > 10 * tws_magnitude:
+            warnings.append("Potential unit mismatch between TWS and soil moisture")
+        
+        if warnings:
+            print("  ⚠️  PHYSICAL REALISM WARNINGS:")
+            for warning in warnings:
+                print(f"    • {warning}")
+            print("  🔧 Consider checking:")
+            print("    - Model training units")
+            print("    - GLDAS unit conversion (kg/m² → cm)")
+            print("    - GRACE data preprocessing")
+        else:
+            print("  ✅ Values appear physically reasonable")
+        
+        # Calculate derived groundwater for validation
+        derived_gw = tws_sample - soil_sample - swe_sample
+        gw_range = (float(np.nanmin(derived_gw)), float(np.nanmax(derived_gw)))
+        print(f"  Derived GW range: [{gw_range[0]:.1f}, {gw_range[1]:.1f}] cm")
+        
+        # Groundwater should be the dominant component in many regions
+        gw_magnitude = np.mean([abs(gw_range[0]), abs(gw_range[1])])
+        if gw_magnitude < 0.1 * tws_magnitude:
+            print("  ⚠️  Groundwater component seems too small relative to TWS")
+            print("    This might indicate missing water storage components")
+        
+        return len(warnings) == 0
+    
+    def _warn_missing_components(self):
+        """Warn about missing water storage components."""
+        print("\n⚠️  INCOMPLETE WATER BALANCE WARNING")
+        print("="*45)
+        print("The current equation assumes: TWS = Soil + SWE + Groundwater")
+        print("But REAL total water storage includes:")
+        print("  • Surface water (rivers, lakes, reservoirs)")
+        print("  • Canopy water storage")
+        print("  • Vegetation water storage") 
+        print("  • Other hydrologic components")
+        print("")
+        print("Missing components can be 10-30% of total storage!")
+        print("Consider:")
+        print("  1. Adding surface water data if available")
+        print("  2. Including vegetation water storage estimates")
+        print("  3. Interpreting 'groundwater' as residual storage")
+        print("  4. Validating against independent groundwater data")
     
     def calculate_complete_storage(self, output_mode='complete'):
         """
@@ -141,7 +294,8 @@ class CompleteWaterStorageCalculator:
         
         # Load feature data
         print("\n📦 Loading feature data...")
-        feature_ds = xr.open_dataset("data/processed/feature_stack.nc")
+        # Use complete feature dataset (240 months) for gap-filling
+        feature_ds = xr.open_dataset("data/processed/feature_stack_complete.nc")
         
         # Identify GRACE coverage
         grace_months, all_months, gaps = self._identify_grace_coverage()
@@ -173,6 +327,9 @@ class CompleteWaterStorageCalculator:
         # Calculate water balance components
         print("\n💧 Calculating water balance components...")
         components = self._calculate_components(feature_ds, months_to_process)
+        
+        # Warn about missing components
+        self._warn_missing_components()
         
         # Calculate reference means
         ref_means = self._calculate_reference_means(components, months_to_process)
@@ -444,20 +601,54 @@ class CompleteWaterStorageCalculator:
         }
     
     def _calculate_anomalies_and_groundwater(self, tws_results, components, ref_means, months):
-        """Calculate anomalies and derive groundwater."""
+        """Calculate anomalies and derive groundwater with validation."""
         n_times = len(months)
         
         # Calculate anomalies
         soil_anomalies = components['soil_moisture'] - ref_means['soil_moisture']
         swe_anomalies = components['swe'] - ref_means['swe']
         
+        # CRITICAL: Validate water balance before proceeding
+        print("\n💧 Calculating water balance components...")
+        
+        # Use a sample of data for validation (avoid memory issues)
+        sample_size = min(5, len(tws_results['tws']))
+        tws_sample = tws_results['tws'][:sample_size]
+        soil_sample = soil_anomalies[:sample_size] 
+        swe_sample = swe_anomalies[:sample_size]
+        
+        # Validate physical realism and units
+        is_valid = self._validate_water_balance(tws_sample, soil_sample, swe_sample)
+        
+        if not is_valid:
+            print("  ⚠️  PROCEEDING WITH CAUTION - validation warnings detected")
+            print("  🔧 Results may need careful interpretation")
+        
         # Calculate groundwater as residual
+        print("  Applying water balance equation: GW = TWS - Soil - SWE")
         groundwater = tws_results['tws'] - soil_anomalies - swe_anomalies
         
-        # Apply reasonable bounds
+        # Apply reasonable bounds with warning
         MAX_VALUE = 100  # cm
+        
+        # Check if clipping is needed
+        n_clipped_tws = np.sum((tws_results['tws'] < -MAX_VALUE) | (tws_results['tws'] > MAX_VALUE))
+        n_clipped_gw = np.sum((groundwater < -MAX_VALUE) | (groundwater > MAX_VALUE))
+        
+        if n_clipped_tws > 0:
+            print(f"  ⚠️  Clipping {n_clipped_tws} extreme TWS values to ±{MAX_VALUE} cm")
+        if n_clipped_gw > 0:
+            print(f"  ⚠️  Clipping {n_clipped_gw} extreme groundwater values to ±{MAX_VALUE} cm")
+        
         tws_results['tws'] = np.clip(tws_results['tws'], -MAX_VALUE, MAX_VALUE)
         groundwater = np.clip(groundwater, -MAX_VALUE, MAX_VALUE)
+        
+        # Final statistics
+        print(f"  Final statistics:")
+        print(f"    TWS mean: {float(np.nanmean(tws_results['tws'])):.2f} ± {float(np.nanstd(tws_results['tws'])):.2f} cm")
+        print(f"    Groundwater mean: {float(np.nanmean(groundwater)):.2f} ± {float(np.nanstd(groundwater)):.2f} cm")
+        print(f"    Soil anomaly mean: {float(np.nanmean(soil_anomalies)):.2f} ± {float(np.nanstd(soil_anomalies)):.2f} cm")
+        print(f"    SWE anomaly mean: {float(np.nanmean(swe_anomalies)):.2f} ± {float(np.nanstd(swe_anomalies)):.2f} cm")
         
         return {
             'tws': tws_results['tws'],

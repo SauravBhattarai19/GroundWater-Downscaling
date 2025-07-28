@@ -63,9 +63,12 @@ models:
   # Optional: Custom hyperparameters (override defaults)
   hyperparameters:
     rf:
-      n_estimators: 150       # Increase trees for better performance
-      max_depth: 15           # Allow deeper trees
-      min_samples_split: 4    # More aggressive splitting
+      n_estimators: 50        # Reduced for memory efficiency with large dataset
+      max_depth: 15           # Moderate depth to prevent overfitting
+      min_samples_split: 50   # Higher threshold to reduce memory usage
+      min_samples_leaf: 20    # Higher leaf size for memory efficiency
+      max_features: 0.3       # Use only 30% of features per tree
+      max_samples: 0.8        # Bootstrap 80% of samples to reduce memory
     
     xgb:
       n_estimators: 250
@@ -98,6 +101,13 @@ models:
     save_feature_importance: true
     save_predictions: true
 
+# Scientific processing options
+scientific:
+  resampling: true           # Use appropriate resampling for each data type
+  grace_method: 'gaussian'   # 'gaussian', 'conservative', or 'bilinear'
+  categorical_encoding: false # One-hot encode land cover (changes feature count)
+  use_weight_mask: true      # Weight training by GRACE measurement density
+
 # ========== PIPELINE SETTINGS ==========
 pipeline:
   # Which model to use for groundwater calculation
@@ -105,7 +115,7 @@ pipeline:
   groundwater_model: "best"   # Use the best performing model
   
   # Alternative models to try if primary fails
-  fallback_models: ["rf", "nn","xgb", "ensemble"]
+  fallback_models: ["nn","xgb", "ensemble"]
   
   # Skip model training if models already exist
   skip_training_if_exists: false

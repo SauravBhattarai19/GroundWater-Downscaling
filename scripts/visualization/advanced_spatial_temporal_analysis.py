@@ -109,9 +109,26 @@ class AdvancedGRACEVisualizer:
             # Ensure CRS is WGS84
             if self.shapefile.crs != 'EPSG:4326':
                 print(f"   Converting from {self.shapefile.crs} to EPSG:4326...")
-                self.shapefile = self.shapefile.to_crs('EPSG:4326')
+                try:
+                    # Try conversion with error checking
+                    self.shapefile = self.shapefile.to_crs('EPSG:4326')
+                    
+                    # Validate conversion worked
+                    test_bounds = self.shapefile.total_bounds
+                    if not np.all(np.isfinite(test_bounds)):
+                        print("   ⚠️ CRS conversion resulted in invalid bounds, keeping original CRS")
+                        # Reload with original CRS
+                        self.shapefile = gpd.read_file(shapefile_path)
+                        print(f"   Keeping original CRS: {self.shapefile.crs}")
+                    else:
+                        print(f"   ✅ CRS conversion successful")
+                        
+                except Exception as e:
+                    print(f"   ❌ CRS conversion failed: {e}, keeping original CRS")
+                    # Reload with original CRS
+                    self.shapefile = gpd.read_file(shapefile_path)
             
-            # Calculate bounds safely
+            # Calculate bounds safely with multiple fallback methods
             try:
                 # Method 1: Use total_bounds
                 bounds = self.shapefile.total_bounds
@@ -119,19 +136,44 @@ class AdvancedGRACEVisualizer:
                 # Check if bounds are valid
                 if not np.all(np.isfinite(bounds)):
                     print("   ⚠️ Invalid bounds from total_bounds, trying alternative method...")
-                    # Method 2: Calculate from geometry bounds
-                    minx = self.shapefile.geometry.bounds.minx.min()
-                    miny = self.shapefile.geometry.bounds.miny.min()
-                    maxx = self.shapefile.geometry.bounds.maxx.max()
-                    maxy = self.shapefile.geometry.bounds.maxy.max()
-                    bounds = np.array([minx, miny, maxx, maxy])
+                    
+                    # Method 2: Calculate from individual geometry bounds
+                    try:
+                        bounds_df = self.shapefile.geometry.bounds
+                        minx = bounds_df.minx.min()
+                        miny = bounds_df.miny.min()
+                        maxx = bounds_df.maxx.max()
+                        maxy = bounds_df.maxy.max()
+                        bounds = np.array([minx, miny, maxx, maxy])
+                        
+                        # Check if these bounds are valid
+                        if not np.all(np.isfinite(bounds)):
+                            print("   ⚠️ Alternative bounds method also failed, trying envelope method...")
+                            
+                            # Method 3: Use envelope of all geometries
+                            envelope = self.shapefile.geometry.unary_union.envelope
+                            minx, miny, maxx, maxy = envelope.bounds
+                            bounds = np.array([minx, miny, maxx, maxy])
+                            
+                            if not np.all(np.isfinite(bounds)):
+                                print("   ⚠️ All bounds methods failed, using original bounds before conversion")
+                                bounds = original_bounds
+                                
+                    except Exception as e2:
+                        print(f"   ⚠️ Alternative bounds calculation failed: {e2}, using original bounds")
+                        bounds = original_bounds
                 
-                self.shapefile_bounds = bounds
-                print(f"   Final bounds: {self.shapefile_bounds}")
+                # Validate final bounds
+                if np.all(np.isfinite(bounds)) and bounds[2] > bounds[0] and bounds[3] > bounds[1]:
+                    self.shapefile_bounds = bounds
+                    print(f"   ✅ Final bounds: {self.shapefile_bounds}")
+                else:
+                    print("   ❌ Final bounds validation failed, using original bounds")
+                    self.shapefile_bounds = original_bounds
                 
             except Exception as e:
-                print(f"   ❌ Error calculating bounds: {e}")
-                self.shapefile_bounds = None
+                print(f"   ❌ Error calculating bounds: {e}, using original bounds")
+                self.shapefile_bounds = original_bounds
                 
         else:
             print("⚠️ No shapefile found, will use full domain")
@@ -173,15 +215,46 @@ class AdvancedGRACEVisualizer:
         # Add shapefile boundary if available and requested
         if add_shapefile and self.shapefile is not None:
             try:
-                self.shapefile.boundary.plot(ax=ax, color='black', linewidth=1.5,
-                                           transform=ccrs.PlateCarree())
+                # Try different methods to plot shapefile boundary
+                
+                # Method 1: Direct boundary plot
+                try:
+                    self.shapefile.boundary.plot(ax=ax, color='black', linewidth=1.5,
+                                               transform=ccrs.PlateCarree())
+                except Exception as e1:
+                    print(f"    ⚠️ Direct boundary plot failed: {e1}")
+                    
+                    # Method 2: Manual geometry plotting
+                    try:
+                        for idx, row in self.shapefile.iterrows():
+                            geom = row.geometry
+                            if geom.is_valid:
+                                if geom.type == 'Polygon':
+                                    x, y = geom.exterior.xy
+                                    ax.plot(x, y, 'k-', linewidth=1.5, transform=ccrs.PlateCarree())
+                                elif geom.type == 'MultiPolygon':
+                                    for poly in geom.geoms:
+                                        if poly.is_valid:
+                                            x, y = poly.exterior.xy
+                                            ax.plot(x, y, 'k-', linewidth=1.5, transform=ccrs.PlateCarree())
+                    except Exception as e2:
+                        print(f"    ⚠️ Manual geometry plot failed: {e2}")
+                        
+                        # Method 3: Skip shapefile plotting
+                        print(f"    ⚠️ All shapefile plotting methods failed, continuing without boundary")
+                
             except Exception as e:
                 print(f"    ⚠️ Could not plot shapefile boundary: {e}")
         
         # Add gridlines
-        gl = ax.gridlines(draw_labels=True, alpha=0.5)
-        gl.top_labels = False
-        gl.right_labels = False
+        try:
+            gl = ax.gridlines(draw_labels=True, alpha=0.5)
+            gl.top_labels = False
+            gl.right_labels = False
+        except Exception as e:
+            print(f"    ⚠️ Could not add gridlines: {e}")
+            # Add basic gridlines without labels
+            gl = ax.gridlines(alpha=0.5)
         
         return gl
     
@@ -252,36 +325,99 @@ class AdvancedGRACEVisualizer:
         print(f"    Data lat range: {float(self.gws_ds.lat.min())} to {float(self.gws_ds.lat.max())}")
         
         if regionmask is None:
-            print("    ⚠️ regionmask not available, skipping mask creation")
-            self.region_mask = None
+            print("    ⚠️ regionmask not available, trying basic mask creation")
+            self.region_mask = self._create_basic_mask()
             return
         
         try:
+            # Validate shapefile geometry first
+            if not self.shapefile.is_valid.all():
+                print("    ⚠️ Some geometries are invalid, attempting to fix...")
+                self.shapefile['geometry'] = self.shapefile['geometry'].buffer(0)
+            
             # Create a mask using regionmask
             if len(self.shapefile) == 1:
                 # Single polygon
-                region = regionmask.Regions([self.shapefile.geometry[0]], 
-                                          names=['Mississippi_Basin'])
+                geom = self.shapefile.geometry.iloc[0]
             else:
                 # Multiple polygons - union them
                 try:
                     # Try union_all() for newer geopandas versions
-                    unified = self.shapefile.union_all()
+                    geom = self.shapefile.union_all()
                 except AttributeError:
                     # Fall back to unary_union for older versions
-                    unified = self.shapefile.geometry.unary_union
-                region = regionmask.Regions([unified], names=['Mississippi_Basin'])
+                    geom = self.shapefile.geometry.unary_union
+            
+            # Check if geometry is valid
+            if not geom.is_valid:
+                print("    ⚠️ Geometry is invalid, attempting to fix...")
+                geom = geom.buffer(0)
+            
+            region = regionmask.Regions([geom], names=['Mississippi_Basin'])
             
             # Create mask for the groundwater grid
             self.region_mask = region.mask(self.gws_ds.lon, self.gws_ds.lat)
             
             # Count valid pixels
             n_valid = np.sum(~np.isnan(self.region_mask))
-            print(f"    ✅ Mask created: {n_valid} valid pixels")
+            print(f"    ✅ regionmask created: {n_valid} valid pixels")
+            
+            # If regionmask failed to create valid pixels, try basic mask
+            if n_valid == 0:
+                print("    ⚠️ regionmask created 0 valid pixels, trying basic mask...")
+                self.region_mask = self._create_basic_mask()
             
         except Exception as e:
-            print(f"    ⚠️ Error creating mask: {e}")
-            self.region_mask = None
+            print(f"    ⚠️ Error creating regionmask: {e}, trying basic mask...")
+            self.region_mask = self._create_basic_mask()
+    
+    def _create_basic_mask(self):
+        """Create a basic mask using point-in-polygon testing."""
+        try:
+            from shapely.geometry import Point
+            
+            print("    🔧 Creating basic mask using point-in-polygon...")
+            
+            # Get data coordinates
+            lon_1d = self.gws_ds.lon.values
+            lat_1d = self.gws_ds.lat.values
+            
+            # Create coordinate grids (lon x lat)
+            lon_grid, lat_grid = np.meshgrid(lon_1d, lat_1d)
+            
+            # Union all geometries
+            if len(self.shapefile) == 1:
+                union_geom = self.shapefile.geometry.iloc[0]
+            else:
+                try:
+                    union_geom = self.shapefile.union_all()
+                except AttributeError:
+                    union_geom = self.shapefile.geometry.unary_union
+            
+            # Check if geometry is valid
+            if not union_geom.is_valid:
+                union_geom = union_geom.buffer(0)
+            
+            # Initialize mask
+            mask = np.full(lon_grid.shape, np.nan)
+            
+            # Test each grid point (with progress for large grids)
+            n_lat, n_lon = len(lat_1d), len(lon_1d)
+            n_inside = 0
+            
+            for i in range(n_lat):
+                for j in range(n_lon):
+                    point = Point(lon_grid[i, j], lat_grid[i, j])
+                    if union_geom.contains(point) or union_geom.touches(point):
+                        mask[i, j] = 0.0  # Valid pixel
+                        n_inside += 1
+            
+            print(f"    ✅ Basic mask created: {n_inside} valid pixels")
+            return mask
+            
+        except Exception as e:
+            print(f"    ❌ Basic mask creation failed: {e}")
+            return None
     
     def calculate_pixel_trends(self, data_array, min_years=5):
         """

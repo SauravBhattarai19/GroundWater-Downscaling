@@ -27,13 +27,14 @@ class GRACEComparisonAnalysis:
     def __init__(self, results_dir="results", data_dir="data"):
         self.results_dir = Path(results_dir)
         self.data_dir = Path(data_dir)
-        self.grace_original_dir = Path("data/raw/grace_original")
+        self.grace_original_dir = Path("data/raw/grace")
         self.figures_dir = Path("figures") / "grace_comparison"
         self.figures_dir.mkdir(parents=True, exist_ok=True)
         
     def load_original_grace_data(self):
         """Load the downloaded original GRACE data."""
         print("📂 Loading original GRACE data...")
+        print(f"   🔍 Looking in directory: {self.grace_original_dir.absolute()}")
         
         # Find all GRACE files
         grace_files = sorted(glob.glob(str(self.grace_original_dir / "*.tif")))
@@ -44,6 +45,9 @@ class GRACEComparisonAnalysis:
             return None
         
         print(f"   📊 Found {len(grace_files)} GRACE files")
+        print(f"   📁 First few files:")
+        for i, f in enumerate(grace_files[:3]):
+            print(f"      {i+1}. {Path(f).name}")
         
         # Load and combine all files
         grace_datasets = []
@@ -53,8 +57,26 @@ class GRACEComparisonAnalysis:
             try:
                 # Extract date from filename
                 filename = Path(file_path).stem
-                # Expected format: YYYYMMDD_YYYYMMDD.tif (start_date_end_date)
+                print(f"   🔍 Processing file: {filename}")
                 
+                # Load the dataset first to inspect it
+                ds = xr.open_dataset(file_path, engine='rasterio')
+                ds = ds.squeeze()  # Remove any singleton dimensions
+                
+                # Print dataset info for first few files
+                if len(grace_datasets) < 3:
+                    print(f"      📊 Dataset info:")
+                    print(f"         Variables: {list(ds.data_vars)}")
+                    print(f"         Coordinates: {list(ds.coords)}")
+                    print(f"         Shape: {ds.dims}")
+                    
+                    # Check data values
+                    for var in ds.data_vars:
+                        data_vals = ds[var].values
+                        print(f"         {var} stats: min={np.nanmin(data_vals):.3f}, max={np.nanmax(data_vals):.3f}, mean={np.nanmean(data_vals):.3f}")
+                        print(f"         {var} units: {ds[var].attrs.get('units', 'No units specified')}")
+                
+                # Expected format: YYYYMMDD_YYYYMMDD.tif (start_date_end_date)
                 if '_' in filename and len(filename.split('_')) == 2:
                     start_date_str, end_date_str = filename.split('_')
                     
@@ -80,14 +102,10 @@ class GRACEComparisonAnalysis:
                         center_date = datetime(center_date.year, center_date.month, 1)
                         
                         dates.append(center_date)
-                        
-                        # Load the dataset
-                        ds = xr.open_dataset(file_path, engine='rasterio')
-                        ds = ds.squeeze()  # Remove any singleton dimensions
                         grace_datasets.append(ds)
                         
                         if len(dates) <= 5:  # Show first few for debugging
-                            print(f"   📅 File: {filename} -> Date: {center_date.strftime('%Y-%m-%d')}")
+                            print(f"      📅 Date: {center_date.strftime('%Y-%m-%d')}")
                     else:
                         print(f"   ⚠️ Invalid date format in filename: {filename}")
                 else:
@@ -115,6 +133,7 @@ class GRACEComparisonAnalysis:
                     coord_mapping[coord] = 'lat'
             
             if coord_mapping:
+                print(f"      🔄 Renaming coordinates: {coord_mapping}")
                 grace_datasets[i] = ds.rename(coord_mapping)
         
         # Stack along time dimension
@@ -123,6 +142,8 @@ class GRACEComparisonAnalysis:
         
         # Ensure we have the right variable name
         var_names = list(combined_grace.data_vars)
+        print(f"   📊 Available variables: {var_names}")
+        
         if len(var_names) == 1:
             grace_var = var_names[0]
         else:
@@ -136,13 +157,97 @@ class GRACEComparisonAnalysis:
                 grace_var = var_names[0]  # Use first variable as fallback
         
         self.grace_original = combined_grace[grace_var]
+        
+        # Print comprehensive statistics
         print(f"   ✅ Loaded {len(dates)} GRACE timesteps")
         print(f"   📊 Using variable: {grace_var}")
         print(f"   🗓️ Time range: {min(dates).strftime('%Y-%m')} to {max(dates).strftime('%Y-%m')}")
+        print(f"   🌍 Spatial extent: lat {float(self.grace_original.lat.min()):.2f} to {float(self.grace_original.lat.max()):.2f}")
+        print(f"                     lon {float(self.grace_original.lon.min()):.2f} to {float(self.grace_original.lon.max()):.2f}")
+        print(f"   📏 Resolution: {len(self.grace_original.lat)} x {len(self.grace_original.lon)} pixels")
+        
+        # Data statistics
+        grace_data = self.grace_original.values
+        print(f"   📈 Data statistics:")
+        print(f"      Min: {np.nanmin(grace_data):.3f}")
+        print(f"      Max: {np.nanmax(grace_data):.3f}")
+        print(f"      Mean: {np.nanmean(grace_data):.3f}")
+        print(f"      Std: {np.nanstd(grace_data):.3f}")
+        print(f"      Units: {self.grace_original.attrs.get('units', 'Not specified')}")
         
         return self.grace_original
     
     def load_downscaled_data(self):
+        """Load the downscaled data from results."""
+        print("📂 Loading downscaled data...")
+        print(f"   🔍 Looking in directory: {self.results_dir.absolute()}")
+        
+        # List all files in results directory
+        results_files = list(self.results_dir.glob("*.nc"))
+        print(f"   📁 Found NetCDF files: {[f.name for f in results_files]}")
+        
+        # Load TWS complete data
+        try:
+            tws_path = self.results_dir / "tws_complete.nc"
+            print(f"   🔍 Checking TWS file: {tws_path}")
+            if tws_path.exists():
+                self.tws_downscaled = xr.open_dataset(tws_path)
+                print(f"   ✅ TWS data loaded:")
+                print(f"      Variables: {list(self.tws_downscaled.data_vars)}")
+                print(f"      Coordinates: {list(self.tws_downscaled.coords)}")
+                print(f"      Time steps: {self.tws_downscaled.time.size}")
+                print(f"      Spatial: {self.tws_downscaled.lat.size} x {self.tws_downscaled.lon.size}")
+                print(f"      Time range: {pd.to_datetime(self.tws_downscaled.time.values[0]).strftime('%Y-%m')} to {pd.to_datetime(self.tws_downscaled.time.values[-1]).strftime('%Y-%m')}")
+            else:
+                print(f"   ❌ {tws_path} does not exist")
+                self.tws_downscaled = None
+        except Exception as e:
+            print(f"   ⚠️ Error loading TWS: {e}")
+            self.tws_downscaled = None
+        
+        # Load groundwater data as backup
+        try:
+            gw_path = self.results_dir / "groundwater_complete.nc"
+            print(f"   🔍 Checking groundwater file: {gw_path}")
+            if gw_path.exists():
+                self.gw_downscaled = xr.open_dataset(gw_path)
+                print(f"   ✅ Groundwater data loaded:")
+                print(f"      Variables: {list(self.gw_downscaled.data_vars)}")
+                print(f"      Coordinates: {list(self.gw_downscaled.coords)}")
+                print(f"      Time steps: {self.gw_downscaled.time.size}")
+                print(f"      Spatial: {self.gw_downscaled.lat.size} x {self.gw_downscaled.lon.size}")
+                print(f"      Time range: {pd.to_datetime(self.gw_downscaled.time.values[0]).strftime('%Y-%m')} to {pd.to_datetime(self.gw_downscaled.time.values[-1]).strftime('%Y-%m')}")
+            else:
+                print(f"   ❌ {gw_path} does not exist")
+                self.gw_downscaled = None
+        except Exception as e:
+            print(f"   ⚠️ Error loading groundwater: {e}")
+            self.gw_downscaled = None
+        
+        # Use TWS if available, otherwise groundwater
+        if self.tws_downscaled is not None:
+            self.downscaled_data = self.tws_downscaled
+            self.data_var = 'tws' if 'tws' in self.downscaled_data.data_vars else list(self.downscaled_data.data_vars)[0]
+            print(f"   🎯 Using TWS data variable: {self.data_var}")
+        elif self.gw_downscaled is not None:
+            self.downscaled_data = self.gw_downscaled
+            self.data_var = 'groundwater' if 'groundwater' in self.downscaled_data.data_vars else list(self.downscaled_data.data_vars)[0]
+            print(f"   🎯 Using groundwater data variable: {self.data_var}")
+        else:
+            raise FileNotFoundError("No downscaled data files found!")
+        
+        # Print detailed statistics for downscaled data
+        downscaled_values = self.downscaled_data[self.data_var].values
+        print(f"   📈 Downscaled data statistics:")
+        print(f"      Min: {np.nanmin(downscaled_values):.3f}")
+        print(f"      Max: {np.nanmax(downscaled_values):.3f}")
+        print(f"      Mean: {np.nanmean(downscaled_values):.3f}")
+        print(f"      Std: {np.nanstd(downscaled_values):.3f}")
+        print(f"      Units: {self.downscaled_data[self.data_var].attrs.get('units', 'Not specified')}")
+        print(f"   🌍 Spatial extent: lat {float(self.downscaled_data.lat.min()):.2f} to {float(self.downscaled_data.lat.max()):.2f}")
+        print(f"                     lon {float(self.downscaled_data.lon.min()):.2f} to {float(self.downscaled_data.lon.max()):.2f}")
+        
+        return self.downscaled_data
         """Load the downscaled data from results."""
         print("📂 Loading downscaled data...")
         
@@ -177,6 +282,75 @@ class GRACEComparisonAnalysis:
             raise FileNotFoundError("No downscaled data files found!")
         
         return self.downscaled_data
+
+    def check_data_compatibility(self):
+        """Check if GRACE and downscaled data are compatible."""
+        print("🔍 Checking data compatibility...")
+        
+        issues = []
+        
+        # Check units
+        grace_units = self.grace_original.attrs.get('units', 'unknown')
+        downscaled_units = self.downscaled_data[self.data_var].attrs.get('units', 'unknown')
+        
+        print(f"   📏 Units - GRACE: {grace_units}, Downscaled: {downscaled_units}")
+        
+        # Check value ranges
+        grace_range = (float(self.grace_original.min()), float(self.grace_original.max()))
+        downscaled_range = (float(self.downscaled_data[self.data_var].min()), float(self.downscaled_data[self.data_var].max()))
+        
+        print(f"   📊 Value ranges:")
+        print(f"      GRACE: {grace_range[0]:.3f} to {grace_range[1]:.3f}")
+        print(f"      Downscaled: {downscaled_range[0]:.3f} to {downscaled_range[1]:.3f}")
+        
+        # Check if ranges are vastly different
+        grace_span = grace_range[1] - grace_range[0]
+        downscaled_span = downscaled_range[1] - downscaled_range[0]
+        
+        if grace_span > 0 and downscaled_span > 0:
+            ratio = max(grace_span, downscaled_span) / min(grace_span, downscaled_span)
+            if ratio > 10:
+                issues.append(f"⚠️ Data ranges differ significantly (ratio: {ratio:.1f})")
+        
+        # Check spatial coverage
+        grace_lat_range = (float(self.grace_original.lat.min()), float(self.grace_original.lat.max()))
+        grace_lon_range = (float(self.grace_original.lon.min()), float(self.grace_original.lon.max()))
+        
+        down_lat_range = (float(self.downscaled_data.lat.min()), float(self.downscaled_data.lat.max()))
+        down_lon_range = (float(self.downscaled_data.lon.min()), float(self.downscaled_data.lon.max()))
+        
+        print(f"   🌍 Spatial coverage:")
+        print(f"      GRACE: lat {grace_lat_range[0]:.2f} to {grace_lat_range[1]:.2f}, lon {grace_lon_range[0]:.2f} to {grace_lon_range[1]:.2f}")
+        print(f"      Downscaled: lat {down_lat_range[0]:.2f} to {down_lat_range[1]:.2f}, lon {down_lon_range[0]:.2f} to {down_lon_range[1]:.2f}")
+        
+        # Check time overlap
+        grace_times = pd.to_datetime(self.grace_original.time.values)
+        downscaled_times = pd.to_datetime(self.downscaled_data.time.values)
+        
+        overlap_start = max(grace_times.min(), downscaled_times.min())
+        overlap_end = min(grace_times.max(), downscaled_times.max())
+        
+        print(f"   🗓️ Time overlap: {overlap_start.strftime('%Y-%m')} to {overlap_end.strftime('%Y-%m')}")
+        
+        if overlap_start > overlap_end:
+            issues.append("❌ No time overlap between datasets!")
+        
+        # Check if GRACE data looks like raw satellite values (should be cm of water equivalent)
+        grace_std = float(self.grace_original.std())
+        if grace_std < 0.1:
+            issues.append("⚠️ GRACE data has very low variability - might be wrong variable or units")
+        
+        if abs(float(self.grace_original.mean())) > 100:
+            issues.append("⚠️ GRACE mean value seems too large for water equivalent (cm)")
+        
+        if issues:
+            print("   🚨 POTENTIAL ISSUES DETECTED:")
+            for issue in issues:
+                print(f"      {issue}")
+        else:
+            print("   ✅ Data appears compatible")
+        
+        return issues
     
     def process_timeseries_data(self):
         """Process both datasets to create comparable time series."""
@@ -388,6 +562,61 @@ Downscaled Stats:
             print(f"   ⚠️ Could not create spatial comparison: {e}")
     
     def run_full_comparison(self):
+        """Run the complete comparison analysis."""
+        print("🚀 GRACE ORIGINAL vs DOWNSCALED COMPARISON")
+        print("=" * 60)
+        
+        # Load original GRACE data
+        grace_data = self.load_original_grace_data()
+        if grace_data is None:
+            print("❌ Could not load original GRACE data")
+            print("Ensure GRACE .tif files are in data/raw/grace/ directory!")
+            return None, None, None, None
+        
+        # Load downscaled data
+        self.load_downscaled_data()
+        
+        # Check data compatibility
+        issues = self.check_data_compatibility()
+        
+        if issues:
+            print("\n⚠️ DATA COMPATIBILITY ISSUES DETECTED!")
+            print("Please review the data sources and processing before proceeding.")
+            response = input("Continue anyway? (y/N): ")
+            if response.lower() != 'y':
+                return None, None, None, None
+        
+        # Process time series
+        grace_df, downscaled_df = self.process_timeseries_data()
+        
+        # Create comparison plots
+        comparison_data, correlation, rmse, bias = self.create_comparison_plots(grace_df, downscaled_df)
+        
+        if comparison_data is not None:
+            # Create spatial comparison
+            self.create_spatial_comparison()
+            
+            print("\n" + "=" * 60)
+            print("📋 FINAL COMPARISON SUMMARY")
+            print("=" * 60)
+            print(f"✅ Comparison completed successfully!")
+            print(f"📊 Correlation: {correlation:.3f}")
+            print(f"📈 RMSE: {rmse:.2f} cm")
+            print(f"⚖️ Bias: {bias:.2f} cm")
+            print(f"📅 Overlapping observations: {len(comparison_data)}")
+            print(f"🗂️ Results saved to: {self.figures_dir}")
+            
+            # Assessment
+            if correlation > 0.8:
+                print("🎉 EXCELLENT agreement between original and downscaled data!")
+            elif correlation > 0.6:
+                print("✅ GOOD agreement between original and downscaled data!")
+            elif correlation > 0.4:
+                print("⚠️ MODERATE agreement - room for improvement")
+            else:
+                print("⚠️ POOR agreement - significant differences detected")
+        
+        return grace_df, downscaled_df, comparison_data, {'correlation': correlation, 'rmse': rmse, 'bias': bias} if comparison_data is not None else None
         """Run the complete comparison analysis."""
         print("🚀 GRACE ORIGINAL vs DOWNSCALED COMPARISON")
         print("=" * 60)

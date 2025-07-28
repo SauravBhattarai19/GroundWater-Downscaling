@@ -25,11 +25,12 @@ from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 from sklearn.base import BaseEstimator, RegressorMixin
+from src.utils import resample_grace_scientifically, create_grace_weight_mask, validate_grace_values
 
 warnings.filterwarnings('ignore')
 
 # Advanced ML imports with graceful fallbacks
-AVAILABLE_MODELS = ['rf', 'nn', 'svr', 'gbr']  # Always available
+AVAILABLE_MODELS = ['nn', 'xgb']  # Always available
 
 try:
     import xgboost as xgb
@@ -188,17 +189,22 @@ class ModelManager:
         max_cores = max(1, multiprocessing.cpu_count() // 2)  # 50% of cores
         print(f"🔧 Limiting parallelization to {max_cores} cores (50% of available)")
         
+        # Get hyperparameters from config
+        rf_params = self.config.get('models', {}).get('hyperparameters', {}).get('rf', {})
+        
         self.model_configs = {
             'rf': {
                 'name': 'Random Forest',
                 'model': RandomForestRegressor(
-                    n_estimators=100,
-                    max_depth=15,
-                    min_samples_split=10,
-                    min_samples_leaf=3,
-                    max_features='sqrt',
-                    n_jobs=max_cores//2,  # ✅ LIMITED instead of -1
+                    n_estimators=rf_params.get('n_estimators', 50),
+                    max_depth=rf_params.get('max_depth', 15),
+                    min_samples_split=rf_params.get('min_samples_split', 50),
+                    min_samples_leaf=rf_params.get('min_samples_leaf', 20),
+                    max_features=rf_params.get('max_features', 0.3),
+                    max_samples=rf_params.get('max_samples', 0.8),
+                    n_jobs=min(32, max_cores//2),  # ✅ VERY LIMITED for large datasets
                     random_state=42,
+                    verbose=1  # Show progress
                 ),
                 'needs_scaling': False
             },
@@ -449,7 +455,7 @@ class ModelManager:
         }
     
     def _load_grace_tws(self, grace_dir, reference_raster=None):
-        """Load GRACE TWS data with robust string handling."""
+        """Load GRACE TWS data with optional scientific resampling."""
         import re
         from datetime import datetime
         
@@ -459,7 +465,6 @@ class ModelManager:
         if not grace_files:
             raise ValueError(f"No GRACE .tif files found in {grace_dir}")
         
-        # Import here to avoid issues if rioxarray not available
         try:
             import rioxarray as rxr
             import rasterio.enums
@@ -469,9 +474,14 @@ class ModelManager:
         grace_data = []
         grace_dates = []
         
+        # Check if scientific mode is enabled
+        use_scientific = getattr(self, 'use_scientific_grace', True)  # Default to True
+        
+        if use_scientific:
+            print("  🔬 Using scientific GRACE resampling")
+        
         for grace_file in grace_files:
             try:
-                # Convert filename to string if it's a numpy string
                 filename_str = safe_str_conversion(grace_file)
                 
                 match = re.match(r'(\d{8})_(\d{8})\.tif', filename_str)
@@ -483,12 +493,20 @@ class ModelManager:
                     grace_path = os.path.join(grace_dir, filename_str)
                     grace_raster = rxr.open_rasterio(grace_path, masked=True).squeeze()
                     
-                    # **NEW: Resample GRACE to match reference resolution**
+                    # Use scientific resampling if enabled
                     if reference_raster is not None:
-                        grace_raster = grace_raster.rio.reproject_match(
-                            reference_raster,
-                            resampling=rasterio.enums.Resampling.bilinear
-                        )
+                        if use_scientific:
+                            grace_raster = resample_grace_scientifically(
+                                grace_raster,
+                                reference_raster,
+                                method='gaussian'  # or 'conservative'
+                            )
+                        else:
+                            # Original bilinear resampling
+                            grace_raster = grace_raster.rio.reproject_match(
+                                reference_raster,
+                                resampling=rasterio.enums.Resampling.bilinear
+                            )
                     
                     grace_data.append(grace_raster.values)
                     grace_dates.append(grace_date)
@@ -496,6 +514,11 @@ class ModelManager:
                 print(f"⚠️ Error loading {grace_file}: {e}")
         
         print(f"   Successfully loaded {len(grace_data)} GRACE files")
+        
+        # Validate GRACE values
+        if use_scientific and len(grace_data) > 0:
+            validate_grace_values(np.concatenate([g.flatten() for g in grace_data]))
+        
         return np.stack(grace_data), grace_dates
     
     def _create_lagged_features(self, X_data, lag_months=[1, 3, 6]):
