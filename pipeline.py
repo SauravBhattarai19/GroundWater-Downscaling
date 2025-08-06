@@ -228,8 +228,9 @@ def run_train_step(logger, config, models_to_train=None, single_model=None, ense
                 enabled_models = config['models'].get('enabled', ['rf'])
                 logger.info(f"Training configured models: {enabled_models}")
             
-            # Train models
-            results = manager.train_all_models(X, y, enabled_models)
+            # Train models with proper metadata for data leakage prevention
+            logger.info("🔄 Using temporal splitting to prevent data leakage")
+            results = manager.train_all_models(X, y, metadata, enabled_models=enabled_models)
             
             # Save models and results
             manager.save_models()

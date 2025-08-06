@@ -47,10 +47,10 @@ models:
   # Based on performance results: NN (R²=0.8818), RF (R²=0.8664), XGBoost (R²=0.8182)
   enabled:
     - rf          # Neural Network (BEST: R²=0.8818, RMSE=3.7252)
-    - nn          # Random Forest (2nd: R²=0.8664, RMSE=3.9609)
-    - xgb         # XGBoost (3rd: R²=0.8182, RMSE=4.6200)
+    #- nn          # Random Forest (2nd: R²=0.8664, RMSE=3.9609)
+    #- xgb         # XGBoost (3rd: R²=0.8182, RMSE=4.6200)
     #- gbr         # Gradient Boosting
-    # - svr       # Support Vector Regression (slower for large data)
+    #- svr       # Support Vector Regression (slower for large data)
   
   # Model training settings
   test_size: 0.2              # Fraction of data for testing
@@ -63,12 +63,10 @@ models:
   # Optional: Custom hyperparameters (override defaults)
   hyperparameters:
     rf:
-      n_estimators: 50        # Reduced for memory efficiency with large dataset
-      max_depth: 15           # Moderate depth to prevent overfitting
-      min_samples_split: 50   # Higher threshold to reduce memory usage
-      min_samples_leaf: 20    # Higher leaf size for memory efficiency
-      max_features: 0.3       # Use only 30% of features per tree
-      max_samples: 0.8        # Bootstrap 80% of samples to reduce memory
+      n_estimators: 50        # VERY conservative for 75M+ samples
+      max_depth: 32            # Shallow trees to reduce memory
+      min_samples_split: 100  # Much higher threshold for large dataset
+      min_samples_leaf: 50   # Large leaf size to reduce nodes
     
     xgb:
       n_estimators: 250
@@ -119,3 +117,7 @@ pipeline:
   
   # Skip model training if models already exist
   skip_training_if_exists: false
+
+# src/config.yaml - Add this
+grace_data_type: "mascon"
+grace_native_resolution_km: 55.66

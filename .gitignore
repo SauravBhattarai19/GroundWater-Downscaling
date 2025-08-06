@@ -34,6 +34,8 @@ models/
 models_1/
 models_old_bounds/
 models_1_old_bounds/
+models_backup/
+notebooks/
 *.joblib
 *.pkl
 *.pickle

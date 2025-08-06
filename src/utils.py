@@ -1,4 +1,4 @@
-# src/utils.py - Enhanced version with scientific GRACE handling
+# src/utils.py - COMPLETE Fixed version for Mascon Data
 
 import ee
 import os
@@ -10,11 +10,42 @@ import pandas as pd
 from scipy import ndimage
 import rasterio.enums
 
-# Configuration flags
-USE_SCIENTIFIC_GRACE = True  # Set to False for original behavior
+# CORRECTED Configuration - now detects automatically
+GRACE_DATA_TYPE = "mascon"  # Will be auto-detected
+MASCON_RESOLUTION_KM = 55.66  # JPL Mascon native resolution
 
+def detect_grace_data_type(grace_dir="data/raw/grace"):
+    """
+    Automatically detect if we're using Mascon or raw GRACE data.
+    """
+    try:
+        grace_files = [f for f in os.listdir(grace_dir) if f.endswith('.tif')]
+        if not grace_files:
+            return "mascon"  # Default assumption
+        
+        # Load a sample file to check resolution
+        sample_file = os.path.join(grace_dir, grace_files[0])
+        sample = rxr.open_rasterio(sample_file, masked=True).squeeze()
+        
+        # Check resolution - Mascon is ~0.5 degrees, raw GRACE is ~3 degrees
+        resolution = abs(float(sample.rio.resolution()[0]))
+        
+        if resolution < 1.0:  # Less than 1 degree = likely Mascon
+            print(f"  🎯 Auto-detected: Mascon data (resolution: {resolution:.3f}°)")
+            return "mascon"
+        else:  # Greater than 1 degree = likely raw GRACE
+            print(f"  🔬 Auto-detected: Raw GRACE data (resolution: {resolution:.3f}°)")
+            return "raw_grace"
+            
+    except Exception as e:
+        print(f"  ⚠️ Could not auto-detect GRACE type: {e}, assuming Mascon")
+        return "mascon"
+
+# Auto-detect on import
+GRACE_DATA_TYPE = detect_grace_data_type()
 
 def create_date_list(start="2003-01", end="2022-12"):
+    """Create list of YYYY-MM dates."""
     from datetime import datetime, timedelta
     dates = []
     current = datetime.strptime(start, "%Y-%m")
@@ -25,8 +56,8 @@ def create_date_list(start="2003-01", end="2022-12"):
         current = current.replace(day=1)
     return dates
 
-
 def bbox_to_geometry(region):
+    """Convert bounding box to Earth Engine geometry."""
     return ee.Geometry.Rectangle([
         region["lon_min"],
         region["lat_min"],
@@ -34,26 +65,27 @@ def bbox_to_geometry(region):
         region["lat_max"]
     ])
 
-
 def reproject_match(src, match):
-    """Reproject src to match CRS of reference raster"""
+    """Reproject src to match CRS of reference raster."""
     return src.rio.reproject_match(match)
-
 
 def resample_match(src, match):
-    """Resample src to match resolution and shape of reference raster"""
+    """Resample src to match resolution and shape of reference raster."""
     return src.rio.reproject_match(match)
 
-
 def match_resolution(src, match):
-    """Alias: Match CRS, resolution, and alignment"""
+    """Alias: Match CRS, resolution, and alignment."""
     return reproject_match(src, match)
-
 
 def parse_grace_months(grace_dir):
     """Parse valid GRACE months from filename ranges."""
     months = set()
     pattern = re.compile(r"(\d{8})_(\d{8})\.tif$")
+    
+    if not os.path.exists(grace_dir):
+        print(f"⚠️ GRACE directory not found: {grace_dir}")
+        return []
+        
     for fname in os.listdir(grace_dir):
         match = pattern.match(fname)
         if match:
@@ -64,47 +96,58 @@ def parse_grace_months(grace_dir):
             months.add(mid.strftime("%Y-%m"))
     return sorted(months)
 
-
 def load_timestamp_map(grace_dir):
     """Load grace-based timestamp map for masking/filtering."""
     valid_months = parse_grace_months(grace_dir)
     return set(valid_months)
 
-
-# ============= NEW SCIENTIFIC GRACE FUNCTIONS =============
-
-def resample_grace_scientifically(grace_data, reference_raster, method='gaussian'):
+def resample_grace_scientifically(grace_data, reference_raster, method='auto'):
     """
-    Resample GRACE data with scientific integrity.
+    CORRECTED: Resample GRACE data with appropriate method for data type.
     
     Parameters:
     -----------
     grace_data : xarray.DataArray
-        Original GRACE data (~50km resolution)
+        GRACE data (Mascon or raw)
     reference_raster : xarray.DataArray  
         Target resolution grid
     method : str
-        'gaussian' : Apply Gaussian smoothing to represent GRACE footprint
-        'conservative' : Area-weighted to preserve total water mass
-        'bilinear' : Original method (not recommended)
+        'auto' : Automatically detect based on GRACE_DATA_TYPE
+        'mascon' : For JPL Mascon data (NO additional smoothing)
+        'raw_grace' : For raw spherical harmonic GRACE (needs smoothing)
+        'gaussian' : Legacy name for raw_grace
+        'conservative' : Area-weighted resampling
+        'bilinear' : Simple bilinear interpolation
         
     Returns:
     --------
     xarray.DataArray
-        Resampled GRACE data
+        Properly resampled GRACE data
     """
-    if not USE_SCIENTIFIC_GRACE or method == 'bilinear':
-        # Original behavior
+    global GRACE_DATA_TYPE
+    
+    if method == 'auto':
+        method = GRACE_DATA_TYPE
+    elif method == 'gaussian':  # Legacy compatibility
+        method = 'raw_grace'
+    
+    if method == 'mascon':
+        print("  🎯 Processing Mascon data (preserving JPL's advanced processing)")
+        
+        # Mascon data is ALREADY optimally processed with geophysical constraints
+        # JPL explicitly states: "do not need to be de-correlated or smoothed"
+        # Just resample directly to preserve all available information
+        
         return grace_data.rio.reproject_match(
             reference_raster,
-            resampling=rasterio.enums.Resampling.bilinear
+            resampling=rasterio.enums.Resampling.bilinear  # Preserves smooth variations
         )
     
-    # GRACE native resolution in degrees (approximately 3° or 300km)
-    GRACE_RESOLUTION = 3.0
-    
-    if method == 'gaussian':
-        print("  🔬 Using Gaussian smoothing for GRACE (scientifically accurate)")
+    elif method == 'raw_grace':
+        print("  🔬 Processing raw GRACE with smoothing (for spherical harmonic data)")
+        
+        # Original logic for raw GRACE spherical harmonic data
+        GRACE_RESOLUTION = 3.0  # degrees (~300km)
         
         # First resample to target resolution
         grace_fine = grace_data.rio.reproject_match(
@@ -112,13 +155,12 @@ def resample_grace_scientifically(grace_data, reference_raster, method='gaussian
             resampling=rasterio.enums.Resampling.bilinear
         )
         
-        # Calculate smoothing kernel size
+        # Apply Gaussian smoothing to represent GRACE's footprint
         target_res = abs(float(reference_raster.rio.resolution()[0]))
-        sigma_pixels = GRACE_RESOLUTION / target_res / 2  # Divide by 2 for smoother result
+        sigma_pixels = GRACE_RESOLUTION / target_res / 2
         
-        print(f"    Smoothing with sigma={sigma_pixels:.1f} pixels (~{GRACE_RESOLUTION*111:.0f}km footprint)")
+        print(f"    Smoothing with sigma={sigma_pixels:.1f} pixels (~300km footprint)")
         
-        # Apply Gaussian smoothing
         smoothed = ndimage.gaussian_filter(
             np.nan_to_num(grace_fine.values, nan=0),
             sigma=sigma_pixels,
@@ -128,65 +170,60 @@ def resample_grace_scientifically(grace_data, reference_raster, method='gaussian
         # Restore NaN mask
         smoothed[np.isnan(grace_fine.values)] = np.nan
         
-        # Create output array
         result = grace_fine.copy()
         result.values = smoothed
-        
         return result
-        
+    
     elif method == 'conservative':
-        print("  🔬 Using conservative resampling for GRACE (mass-preserving)")
-        
-        # Use average resampling as approximation of conservative
+        print("  🔧 Using conservative (area-weighted) resampling")
         return grace_data.rio.reproject_match(
             reference_raster,
             resampling=rasterio.enums.Resampling.average
         )
     
+    elif method == 'bilinear':
+        print("  📊 Using simple bilinear resampling")
+        return grace_data.rio.reproject_match(
+            reference_raster,
+            resampling=rasterio.enums.Resampling.bilinear
+        )
+    
     else:
         raise ValueError(f"Unknown GRACE resampling method: {method}")
 
-
 def create_grace_weight_mask(reference_shape, reference_resolution, min_weight=0.2):
     """
-    Create weight mask for ML training based on GRACE measurement density.
-    
-    Areas between GRACE measurement centers have higher uncertainty
-    and should have lower weight in model training.
-    
-    Parameters:
-    -----------
-    reference_shape : tuple
-        (n_lat, n_lon) shape of target grid
-    reference_resolution : float
-        Resolution in degrees
-    min_weight : float
-        Minimum weight to assign (prevents zero weights)
-        
-    Returns:
-    --------
-    np.ndarray
-        Weight mask same shape as reference
+    UPDATED: Create weight mask appropriate for detected data type.
     """
-    if not USE_SCIENTIFIC_GRACE:
-        # Return uniform weights for compatibility
-        return np.ones(reference_shape)
+    global GRACE_DATA_TYPE
     
-    GRACE_RESOLUTION = 3.0  # degrees
+    if GRACE_DATA_TYPE == "mascon":
+        # Mascon data has much better spatial representation
+        # Create weights based on 55.66 km effective resolution
+        mascon_spacing_km = MASCON_RESOLUTION_KM
+        mascon_spacing_deg = mascon_spacing_km / 111  # Convert km to degrees
+        
+        spacing_pixels = mascon_spacing_deg / reference_resolution
+        
+        # Less aggressive weighting since Mascon is already well-constrained
+        min_weight = 0.7  # Higher minimum weight
+        
+    else:
+        # Original logic for raw GRACE
+        GRACE_RESOLUTION = 3.0  # degrees
+        spacing_pixels = GRACE_RESOLUTION / reference_resolution
+        min_weight = 0.2  # Lower minimum weight due to uncertainty
     
-    # Calculate spacing in pixels
-    grace_spacing_pixels = GRACE_RESOLUTION / reference_resolution
-    
-    # Create grid of GRACE "measurement centers"
+    # Create grid of measurement centers
     n_lat, n_lon = reference_shape
-    lat_centers = np.arange(grace_spacing_pixels/2, n_lat, grace_spacing_pixels)
-    lon_centers = np.arange(grace_spacing_pixels/2, n_lon, grace_spacing_pixels)
+    lat_centers = np.arange(spacing_pixels/2, n_lat, spacing_pixels)
+    lon_centers = np.arange(spacing_pixels/2, n_lon, spacing_pixels)
     
     # Initialize weight mask
     weights = np.zeros((n_lat, n_lon))
     
     # Add Gaussian weight for each measurement center
-    sigma = grace_spacing_pixels / 3  # 3-sigma covers most of footprint
+    sigma = spacing_pixels / 4  # Adjusted for data type
     
     for lat_c in lat_centers:
         for lon_c in lon_centers:
@@ -200,33 +237,34 @@ def create_grace_weight_mask(reference_shape, reference_resolution, min_weight=0
     
     return weights
 
-
-def validate_grace_values(grace_data, warn_threshold=100):
+def validate_grace_values(grace_data, warn_threshold=None):
     """
-    Validate GRACE values are in reasonable range.
+    UPDATED: Validate GRACE values with appropriate thresholds for data type.
+    """
+    global GRACE_DATA_TYPE
     
-    Parameters:
-    -----------
-    grace_data : np.ndarray
-        GRACE TWS anomalies
-    warn_threshold : float
-        Threshold for warning (cm)
-    """
     valid_data = grace_data[~np.isnan(grace_data)]
     if len(valid_data) == 0:
         return
     
     min_val, max_val = valid_data.min(), valid_data.max()
     
-    if abs(min_val) > warn_threshold or abs(max_val) > warn_threshold:
+    # Adjust thresholds based on detected data type
+    if GRACE_DATA_TYPE == "mascon":
+        # Mascon data can have higher variability due to better resolution
+        expected_range = "[-60, 60] cm"
+        extreme_threshold = warn_threshold or 100
+    else:
+        # Raw GRACE typically has lower extremes due to smoothing
+        expected_range = "[-40, 40] cm"  
+        extreme_threshold = warn_threshold or 80
+    
+    if abs(min_val) > extreme_threshold or abs(max_val) > extreme_threshold:
         print(f"  ⚠️ GRACE values outside expected range: [{min_val:.1f}, {max_val:.1f}] cm")
-        print(f"     Expected range: approximately [-50, 50] cm")
+        print(f"     Expected range for {GRACE_DATA_TYPE}: approximately {expected_range}")
         print(f"     Check units (should be cm water equivalent)")
     else:
         print(f"  ✅ GRACE values in reasonable range: [{min_val:.1f}, {max_val:.1f}] cm")
-
-
-# ============= ENHANCED HELPER FUNCTIONS =============
 
 def get_data_type(path_or_name):
     """Determine data type from path or name for appropriate processing."""
@@ -245,18 +283,49 @@ def get_data_type(path_or_name):
     else:
         return 'continuous'
 
+def get_resampling_method(data_name):
+    """Get appropriate resampling method for data type - UPDATED for integration."""
+    data_type = get_data_type(data_name)
+    
+    # Map data types to resampling methods
+    resampling_map = {
+        'categorical': rasterio.enums.Resampling.nearest,
+        'population': rasterio.enums.Resampling.sum,
+        'elevation': rasterio.enums.Resampling.cubic,
+        'precipitation': rasterio.enums.Resampling.average,
+        'grace': rasterio.enums.Resampling.bilinear,  # Will be handled by resample_grace_scientifically
+        'continuous': rasterio.enums.Resampling.bilinear
+    }
+    
+    return resampling_map.get(data_type, rasterio.enums.Resampling.bilinear)
 
 def print_resampling_summary():
     """Print summary of resampling methods being used."""
-    if USE_SCIENTIFIC_GRACE:
-        print("\n🔬 Scientific Resampling Mode ENABLED")
-        print("  - GRACE: Gaussian smoothing (300km footprint)")
-        print("  - Land cover: Nearest neighbor (preserves classes)")
-        print("  - Population: Sum-preserving aggregation")
-        print("  - Elevation: Cubic interpolation")
-        print("  - Precipitation: Area-weighted average")
-        print("  - Other continuous: Bilinear interpolation")
-    else:
-        print("\n📊 Standard Resampling Mode")
-        print("  - All data: Bilinear interpolation")
-        print("  - Population: Sum-preserving aggregation")
+    global GRACE_DATA_TYPE
+    
+    print(f"\n🎯 GRACE Processing Configuration: {GRACE_DATA_TYPE.upper()}")
+    print("="*50)
+    
+    if GRACE_DATA_TYPE == "mascon":
+        print("  🎯 Using JPL Mascon RL06.3Mv04:")
+        print(f"    - Native resolution: {MASCON_RESOLUTION_KM} km")
+        print("    - Already includes geophysical constraints")
+        print("    - NO additional smoothing applied")
+        print("    - Preserves all JPL processing benefits")
+        print("    - Direct resampling with bilinear interpolation")
+        
+    elif GRACE_DATA_TYPE == "raw_grace":
+        print("  🔬 Using raw GRACE spherical harmonic data:")
+        print("    - Native resolution: ~300 km")
+        print("    - Applying Gaussian smoothing")
+        print("    - Representing instrument footprint")
+        
+    print("\n  Other data resampling:")
+    print("    - Land cover: Nearest neighbor (preserves classes)")
+    print("    - Population: Sum-preserving aggregation")
+    print("    - Elevation: Cubic interpolation")
+    print("    - Precipitation: Area-weighted average")
+    print("    - Other continuous: Bilinear interpolation")
+
+# For backward compatibility - keep the USE_SCIENTIFIC_GRACE flag
+USE_SCIENTIFIC_GRACE = True

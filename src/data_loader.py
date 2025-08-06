@@ -136,7 +136,7 @@ def export_usgs_dem(region):
     geemap.ee_export_image(
         dem,
         filename=os.path.join(RAW_DIR, "usgs_dem", "srtm_dem.tif"),
-        scale=750,
+        scale=800,
         region=region
     )
 

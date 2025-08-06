@@ -7,11 +7,14 @@ Handles numpy string type conversion issues properly.
 
 import os
 import sys
+import re
+import multiprocessing
 import numpy as np
 import pandas as pd
 import xarray as xr
 import joblib
 import warnings
+import traceback
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
@@ -30,7 +33,7 @@ from src.utils import resample_grace_scientifically, create_grace_weight_mask, v
 warnings.filterwarnings('ignore')
 
 # Advanced ML imports with graceful fallbacks
-AVAILABLE_MODELS = ['nn', 'xgb']  # Always available
+AVAILABLE_MODELS = ['rf', 'gbr', 'nn', 'svr']  # Always available base models
 
 try:
     import xgboost as xgb
@@ -186,8 +189,8 @@ class ModelManager:
         
         # Calculate 50% of available cores
         import multiprocessing
-        max_cores = max(1, multiprocessing.cpu_count() // 2)  # 50% of cores
-        print(f"🔧 Limiting parallelization to {max_cores} cores (50% of available)")
+        max_cores = max(1, multiprocessing.cpu_count())  # 100% of cores
+        print(f"🔧 Limiting parallelization to {max_cores} cores (100% of available)")
         
         # Get hyperparameters from config
         rf_params = self.config.get('models', {}).get('hyperparameters', {}).get('rf', {})
@@ -202,7 +205,7 @@ class ModelManager:
                     min_samples_leaf=rf_params.get('min_samples_leaf', 20),
                     max_features=rf_params.get('max_features', 0.3),
                     max_samples=rf_params.get('max_samples', 0.8),
-                    n_jobs=min(32, max_cores//2),  # ✅ VERY LIMITED for large datasets
+                    n_jobs=min(128, max_cores),  # ✅ VERY LIMITED for large datasets
                     random_state=42,
                     verbose=1  # Show progress
                 ),
@@ -435,7 +438,7 @@ class ModelManager:
             static_names = [f"static_{i}" for i in range(static_data.shape[0])]
             feature_names.extend(static_names)
         
-        # Reshape for model training
+        # Reshape for model training while preserving temporal structure
         print("   Reshaping data for model training...")
         X = X_enhanced.reshape(n_times, X_enhanced.shape[1], -1).transpose(0, 2, 1).reshape(-1, X_enhanced.shape[1])
         y = grace_tws.reshape(-1)
@@ -446,12 +449,21 @@ class ModelManager:
         X_valid = X[valid_mask]
         y_valid = y[valid_mask]
         
+        # Create temporal indices for proper train/test splitting
+        n_spatial_points = n_lat * n_lon
+        temporal_indices = np.repeat(np.arange(n_times), n_spatial_points)
+        temporal_indices_valid = temporal_indices[valid_mask]
+        
         valid_ratio = len(X_valid) / len(X) * 100
         print(f"✅ Prepared data: {X_valid.shape[0]} valid samples ({valid_ratio:.1f}%), {X_valid.shape[1]} features")
+        print(f"   Temporal structure: {n_times} time periods, {n_spatial_points} spatial points per time")
         
         return X_valid, y_valid, feature_names, {
             'spatial_shape': (n_lat, n_lon),
-            'common_dates': common_dates
+            'common_dates': common_dates,
+            'temporal_indices': temporal_indices_valid,
+            'n_times': n_times,
+            'n_spatial_points': n_spatial_points
         }
     
     def _load_grace_tws(self, grace_dir, reference_raster=None):
@@ -469,7 +481,7 @@ class ModelManager:
             import rioxarray as rxr
             import rasterio.enums
         except ImportError:
-            raise ImportError("rioxarray is required for GRACE data loading")
+            raise ImportError("rioxarray and rasterio are required for GRACE data loading")
         
         grace_data = []
         grace_dates = []
@@ -543,108 +555,213 @@ class ModelManager:
         
         return all_features, feature_names
     
-    def train_all_models(self, X, y, enabled_models=None):
-        """Train all enabled models."""
-        if enabled_models is None:
-            configured_models = self.config['models'].get('enabled', ['rf'])
-            # Filter to only available models
-            enabled_models = [m for m in configured_models if m in AVAILABLE_MODELS]
+    def train_all_models(self, X, y, metadata, enabled_models=None, split_method='temporal'):
+        """
+        Train all enabled models with proper data splitting to prevent leakage.
         
-        # Filter enabled_models to only include available ones
-        enabled_models = [m for m in enabled_models if m in AVAILABLE_MODELS]
-        
-        if not enabled_models:
-            print("⚠️ No valid models specified, defaulting to Random Forest")
-            enabled_models = ['rf']
-        
-        print(f"🚀 Training {len(enabled_models)} models: {enabled_models}")
-        
-        # Split data
-        test_size = self.config['models'].get('test_size', 0.2)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42
-        )
-        
-        # Initialize scaler
-        self.scaler = StandardScaler()
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-        
-        results = []
-        trained_models = []
-        
-        for model_name in enabled_models:
-            if model_name not in self.model_configs:
-                print(f"⚠️ Model {model_name} not available, skipping...")
-                continue
+        Parameters:
+        -----------
+        split_method : str
+            'temporal' (default): Split by time periods (no temporal leakage)
+            'spatial': Split by spatial locations (no spatial leakage) 
+            'random': Random split (may cause leakage - not recommended)
+        """
+        try:
+            # Validate inputs
+            if not isinstance(metadata, dict):
+                raise ValueError(f"metadata must be a dictionary, got {type(metadata)}")
             
-            print(f"\n🔄 Training {self.model_configs[model_name]['name']}...")
+            required_keys = ['temporal_indices', 'n_times', 'common_dates', 'n_spatial_points']
+            missing_keys = [key for key in required_keys if key not in metadata]
+            if missing_keys:
+                raise ValueError(f"metadata missing required keys: {missing_keys}")
             
-            try:
-                config = self.model_configs[model_name]
-                model = config['model']
-                
-                # Choose appropriate data
-                if config['needs_scaling']:
-                    X_train_use = X_train_scaled
-                    X_test_use = X_test_scaled
-                else:
-                    X_train_use = X_train
-                    X_test_use = X_test
-                
-                # Train model
-                start_time = datetime.now()
-                model.fit(X_train_use, y_train)
-                training_time = (datetime.now() - start_time).total_seconds()
-                
-                # Make predictions
-                y_pred_train = model.predict(X_train_use)
-                y_pred_test = model.predict(X_test_use)
-                
-                # Calculate metrics
-                metrics = {
-                    'model_name': model_name,
-                    'display_name': config['name'],
-                    'train_rmse': np.sqrt(mean_squared_error(y_train, y_pred_train)),
-                    'test_rmse': np.sqrt(mean_squared_error(y_test, y_pred_test)),
-                    'train_r2': r2_score(y_train, y_pred_train),
-                    'test_r2': r2_score(y_test, y_pred_test),
-                    'train_mae': mean_absolute_error(y_train, y_pred_train),
-                    'test_mae': mean_absolute_error(y_test, y_pred_test),
-                    'training_time': training_time,
-                    'needs_scaling': config['needs_scaling']
-                }
-                
-                results.append(metrics)
-                
-                # Store trained model
-                self.models[model_name] = {
-                    'model': model,
-                    'config': config,
-                    'metrics': metrics
-                }
-                trained_models.append(model)
-                
-                print(f"  ✅ {config['name']}: R² = {metrics['test_r2']:.4f}, "
-                      f"RMSE = {metrics['test_rmse']:.4f}")
-                
-            except Exception as e:
-                print(f"  ❌ {config['name']} failed: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-        
-        # Store results and identify best model
-        self.results = pd.DataFrame(results)
-        if len(self.results) > 0:
-            best_idx = self.results['test_r2'].idxmax()
-            best_model_name = self.results.loc[best_idx, 'model_name']
-            self.best_model = best_model_name
+            if enabled_models is None:
+                configured_models = self.config['models'].get('enabled', ['rf'])
+                # Filter to only available models
+                enabled_models = [m for m in configured_models if m in AVAILABLE_MODELS]
             
-            print(f"\n🏆 Best model: {self.results.loc[best_idx, 'display_name']} "
-                  f"(R² = {self.results.loc[best_idx, 'test_r2']:.4f})")
-        
-        return self.results
+            # Filter enabled_models to only include available ones
+            enabled_models = [m for m in enabled_models if m in AVAILABLE_MODELS]
+            
+            if not enabled_models:
+                print("⚠️ No valid models specified, defaulting to Random Forest")
+                enabled_models = ['rf']
+            
+            print(f"🚀 Training {len(enabled_models)} models: {enabled_models}")
+            print(f"🔄 Using {split_method} splitting strategy")
+            
+            # Get splitting parameters
+            temporal_indices = metadata['temporal_indices']
+            n_times = metadata['n_times']
+            common_dates = metadata['common_dates']
+            test_size = self.config['models'].get('test_size', 0.2)
+            
+            # Debug information
+            print(f"🔍 Debug info:")
+            print(f"   n_times: {n_times}")
+            print(f"   common_dates type: {type(common_dates)}")
+            print(f"   common_dates length: {len(common_dates) if hasattr(common_dates, '__len__') else 'N/A'}")
+            print(f"   temporal_indices shape: {temporal_indices.shape if hasattr(temporal_indices, 'shape') else 'N/A'}")
+            
+            # Ensure common_dates is a list for indexing
+            if not isinstance(common_dates, list):
+                common_dates = list(common_dates)
+            
+            if split_method == 'temporal':
+                # TEMPORAL SPLITTING - No temporal data leakage!
+                train_time_cutoff = int(n_times * (1 - test_size))
+                
+                # Safely access date ranges
+                try:
+                    start_date = common_dates[0]
+                    train_end_date = common_dates[min(train_time_cutoff-1, len(common_dates)-1)]
+                    test_start_date = common_dates[min(train_time_cutoff, len(common_dates)-1)]
+                    end_date = common_dates[-1]
+                    
+                    print(f"📅 Temporal splitting:")
+                    print(f"   Training periods: {start_date} to {train_end_date} ({train_time_cutoff} periods)")
+                    print(f"   Testing periods: {test_start_date} to {end_date} ({n_times - train_time_cutoff} periods)")
+                except Exception as e:
+                    print(f"⚠️ Warning: Could not display date ranges: {e}")
+                    print(f"   Training: first {train_time_cutoff} periods")
+                    print(f"   Testing: last {n_times - train_time_cutoff} periods")
+                
+                # Create train/test masks based on temporal indices
+                train_mask = temporal_indices < train_time_cutoff
+                test_mask = temporal_indices >= train_time_cutoff
+                
+                X_train = X[train_mask]
+                X_test = X[test_mask]
+                y_train = y[train_mask]
+                y_test = y[test_mask]
+                
+                print(f"   ✅ No temporal data leakage - completely separate time periods!")
+            
+            elif split_method == 'spatial':
+                # SPATIAL SPLITTING - No spatial data leakage!
+                n_spatial_points = metadata['n_spatial_points']
+                
+                print(f"🗺️ Spatial splitting:")
+                print(f"   Total spatial points: {n_spatial_points}")
+                print(f"   Total samples: {len(X)}")
+                
+                # Create spatial indices for each sample
+                spatial_indices = np.tile(np.arange(n_spatial_points), n_times)
+                spatial_indices_valid = spatial_indices[:len(X)]  # Align with valid samples
+                
+                print(f"   Spatial indices shape: {spatial_indices_valid.shape}")
+                
+                # Split spatial locations
+                train_spatial_cutoff = int(n_spatial_points * (1 - test_size))
+                
+                train_mask = spatial_indices_valid < train_spatial_cutoff
+                test_mask = spatial_indices_valid >= train_spatial_cutoff
+                
+                X_train = X[train_mask]
+                X_test = X[test_mask]
+                y_train = y[train_mask]
+                y_test = y[test_mask]
+                
+                print(f"   Training locations: {train_spatial_cutoff} spatial points")
+                print(f"   Testing locations: {n_spatial_points - train_spatial_cutoff} spatial points")
+                print(f"   ✅ No spatial data leakage - completely separate locations!")
+                
+            else:  # split_method == 'random'
+                print("⚠️ WARNING: Random splitting may cause data leakage!")
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=test_size, random_state=42
+                )
+            
+            print(f"   Training samples: {len(X_train):,}")
+            print(f"   Testing samples: {len(X_test):,}")
+            
+            # Initialize scaler
+            self.scaler = StandardScaler()
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+            
+            results = []
+            trained_models = []
+            
+            for model_name in enabled_models:
+                if model_name not in self.model_configs:
+                    print(f"⚠️ Model {model_name} not available, skipping...")
+                    continue
+                
+                print(f"\n🔄 Training {self.model_configs[model_name]['name']}...")
+                
+                try:
+                    config = self.model_configs[model_name]
+                    model = config['model']
+                    
+                    # Choose appropriate data
+                    if config['needs_scaling']:
+                        X_train_use = X_train_scaled
+                        X_test_use = X_test_scaled
+                    else:
+                        X_train_use = X_train
+                        X_test_use = X_test
+                    
+                    # Train model
+                    start_time = datetime.now()
+                    model.fit(X_train_use, y_train)
+                    training_time = (datetime.now() - start_time).total_seconds()
+                    
+                    # Make predictions
+                    y_pred_train = model.predict(X_train_use)
+                    y_pred_test = model.predict(X_test_use)
+                    
+                    # Calculate metrics
+                    metrics = {
+                        'model_name': model_name,
+                        'display_name': config['name'],
+                        'train_rmse': np.sqrt(mean_squared_error(y_train, y_pred_train)),
+                        'test_rmse': np.sqrt(mean_squared_error(y_test, y_pred_test)),
+                        'train_r2': r2_score(y_train, y_pred_train),
+                        'test_r2': r2_score(y_test, y_pred_test),
+                        'train_mae': mean_absolute_error(y_train, y_pred_train),
+                        'test_mae': mean_absolute_error(y_test, y_pred_test),
+                        'training_time': training_time,
+                        'needs_scaling': config['needs_scaling']
+                    }
+                    
+                    results.append(metrics)
+                    
+                    # Store trained model
+                    self.models[model_name] = {
+                        'model': model,
+                        'config': config,
+                        'metrics': metrics
+                    }
+                    trained_models.append(model)
+                    
+                    print(f"  ✅ {config['name']}: R² = {metrics['test_r2']:.4f}, "
+                          f"RMSE = {metrics['test_rmse']:.4f}")
+                    
+                except Exception as e:
+                    print(f"  ❌ {config['name']} failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            # Store results and identify best model
+            self.results = pd.DataFrame(results)
+            if len(self.results) > 0:
+                best_idx = self.results['test_r2'].idxmax()
+                best_model_name = self.results.loc[best_idx, 'model_name']
+                self.best_model = best_model_name
+                
+                print(f"\n🏆 Best model: {self.results.loc[best_idx, 'display_name']} "
+                      f"(R² = {self.results.loc[best_idx, 'test_r2']:.4f})")
+            
+            return self.results
+            
+        except Exception as e:
+            print(f"❌ Error in train_all_models: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def save_models(self, output_dir="models"):
         """Save all trained models."""
@@ -736,8 +853,17 @@ class ModelManager:
             print(f"⚠️ Error creating plots: {e}")
 
 
-def main():
-    """Main function for model training and comparison."""
+def main(split_method='temporal'):
+    """
+    Main function for model training and comparison.
+    
+    Parameters:
+    -----------
+    split_method : str
+        'temporal' (default): Split by time periods (no temporal leakage)
+        'spatial': Split by spatial locations (no spatial leakage)
+        'random': Random split (may cause leakage - not recommended)
+    """
     print("🚀 GRACE Multi-Model Training Pipeline")
     print("="*50)
     
@@ -748,8 +874,8 @@ def main():
         # Prepare data
         X, y, feature_names, metadata = manager.prepare_data()
         
-        # Train all models
-        results = manager.train_all_models(X, y)
+        # Train all models with specified splitting method
+        results = manager.train_all_models(X, y, metadata, split_method=split_method)
         
         # Save models and results
         manager.save_models()
