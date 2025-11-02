@@ -8,6 +8,14 @@ region:
   lon_min: -113.94
   lon_max: -77.84
 
+# Test region for validation
+test_region:
+  name: "Kansas Test Area"
+  lat_min: 37.0
+  lat_max: 39.0
+  lon_min: -99.0
+  lon_max: -96.0
+
 # Use one of the actual GRACE files. Update this with an actual filename you see under data/raw/grace/
 reference_file: data/raw/grace/20030131_20030227.tif
 
@@ -46,9 +54,11 @@ models:
   # Which models to train (available: rf, xgb, lgb, catb, nn, svr, gbr)
   # Based on performance results: NN (R²=0.8818), RF (R²=0.8664), XGBoost (R²=0.8182)
   enabled:
-    - rf          # Neural Network (BEST: R²=0.8818, RMSE=3.7252)
-    #- nn          # Random Forest (2nd: R²=0.8664, RMSE=3.9609)
-    #- xgb         # XGBoost (3rd: R²=0.8182, RMSE=4.6200)
+    
+    #- rf          # Random Forest (proven baseline)
+    - xgb         # XGBoost (proven performer) 
+    #- lgb         # LightGBM (proven performer)
+    #- nn          # Neural Network (with proper scaling)
     #- gbr         # Gradient Boosting
     #- svr       # Support Vector Regression (slower for large data)
   
@@ -60,36 +70,48 @@ models:
   # Model selection strategy
   selection_metric: "test_r2" # Metric to use for best model selection (test_r2, test_rmse, cv_r2_mean)
   
-  # Optional: Custom hyperparameters (override defaults)
+  # TREE-OPTIMIZED: Capacity + Smart Regularization (focus on validation-based early stopping)
   hyperparameters:
     rf:
-      n_estimators: 50        # VERY conservative for 75M+ samples
-      max_depth: 32            # Shallow trees to reduce memory
-      min_samples_split: 100  # Much higher threshold for large dataset
-      min_samples_leaf: 50   # Large leaf size to reduce nodes
+      n_estimators: 200       # RESTORE capacity for complex patterns
+      max_depth: 15           # RESTORE: Trees can handle depth with many features
+      min_samples_split: 250  # Moderate leaf regularization  
+      min_samples_leaf: 125   # Moderate leaf regularization
+      max_features: 'sqrt'    # RESTORE: Let RF select features naturally
+      n_jobs: 64              # MAXIMIZE parallelization for 192-core system 
+      max_samples: 0.8        # Strong bootstrap for generalization
     
     xgb:
-      n_estimators: 250
-      max_depth: 10
-      learning_rate: 0.08
-      subsample: 0.85
+      n_estimators: 500       # RESTORED: Working baseline capacity
+      max_depth: 10           # RESTORED: Balanced depth 
+      learning_rate: 0.05     # RESTORED: Stable learning rate
+      subsample: 0.85         # RESTORED: Good bootstrap
+      reg_alpha: 0.1          # RESTORED: Light L1 regularization  
+      reg_lambda: 0.1         # RESTORED: Light L2 regularization
+      early_stopping_rounds: 50  # RESTORED: Validation-based stopping
+      colsample_bytree: 0.8   # RESTORED: Feature subsampling
+      n_jobs: 64              # MAXIMIZE parallelization for 192-core system
     
     lgb:
-      n_estimators: 250
-      max_depth: 10
-      learning_rate: 0.08
-      subsample: 0.85
+      n_estimators: 500       # HIGH capacity - rely on early stopping  
+      max_depth: 10           # RESTORE: Trees need depth for interactions
+      learning_rate: 0.05     # Lower LR with higher n_estimators for stability
+      subsample: 0.85         # Good bootstrap
+      reg_alpha: 0.1          # LIGHT L1 regularization
+      reg_lambda: 0.1         # LIGHT L2 regularization
+      early_stopping_rounds: 50  # KEY: Validation-based stopping
     
     nn:
-      hidden_layer_sizes: [512, 256, 128, 64]  # Larger network
+      hidden_layer_sizes: [512, 256, 128]  # RESTORE capacity - NN needs it for complex patterns
       max_iter: 1000
       early_stopping: true
+      alpha: 0.001            # RESTORE: Lower regularization, rely on early stopping
   
   # Advanced settings
   advanced:
     # Hyperparameter tuning (if you want to add this later)
-    enable_tuning: false
-    tuning_trials: 50
+    enable_tuning: true     # ENABLED: Fixed temporal CV strategy
+    tuning_trials: 100      # Balanced trials for faster convergence
     
     # Feature selection
     feature_selection: false
@@ -102,7 +124,7 @@ models:
 # Scientific processing options
 scientific:
   resampling: true           # Use appropriate resampling for each data type
-  grace_method: 'gaussian'   # 'gaussian', 'conservative', or 'bilinear'
+  grace_method: 'auto'       # 'auto', 'gaussian', 'conservative', or 'bilinear'
   categorical_encoding: false # One-hot encode land cover (changes feature count)
   use_weight_mask: true      # Weight training by GRACE measurement density
 
@@ -118,6 +140,115 @@ pipeline:
   # Skip model training if models already exist
   skip_training_if_exists: false
 
-# src/config.yaml - Add this
+# ========== DOWNLOAD SETTINGS ==========
+download:
+  # Default datasets to download (can be overridden by --datasets)
+  default_datasets: ["grace", "gldas", "chirps", "terraclimate", "modis", "dem", "openlandmap", "landscan"]
+  
+  # Default region (can be overridden by --region or --test-region)
+  default_region: "mississippi"
+  
+  # Available regions
+  regions:
+    mississippi:
+      name: "Mississippi River Basin"
+      lat_min: 28.84
+      lat_max: 49.74
+      lon_min: -113.94
+      lon_max: -77.84
+    kansas:
+      name: "Kansas Test Area"
+      lat_min: 37.0
+      lat_max: 39.0
+      lon_min: -99.0
+      lon_max: -96.0
+
+# ========== ENHANCED FEATURE PROCESSING ==========
+feature_processing:
+  # OPTIMAL FOR TREES: More features + smart correlation filtering
+  correlation_threshold: 0.9        # RESTORE: Trees handle features well, smart correlation filtering
+  remove_correlated_features: true
+  
+  # Feature selection: Let trees decide what's important
+  max_features: null                # RESTORE: No hard limit, let correlation filtering + tree feature selection work
+  feature_selection_method: "correlation"  # "correlation", "univariate", "mutual_info"
+  
+  # Scaling (CRITICAL for neural networks/SVM)
+  scaling_method: "robust"          # "standard", "robust", "minmax", "none"
+  
+  # Temporal features - HYBRID APPROACH: Advanced from features.py + basic cyclical
+  add_temporal_lags: false        # DISABLED: Using comprehensive lag features from features.py
+  lag_months: [1, 3, 6]            # Add 1, 3, 6 month lags  
+  add_seasonal_features: true      # ENABLED: Add month_sin/month_cos (complements our anomaly features)
+  
+  # Advanced options
+  pca_components: null              # null = no PCA, number = PCA components
+  chunk_size: 50                    # Process in chunks to save memory
+  validate_units: true              # Fix temperature/precipitation units
+  
+  # Model-specific scaling
+  models_needing_scaling: ["nn", "svr"]  # RF handles categorical features better without scaling
+  models_tree_based: ["rf", "xgb", "lgb", "catb", "gbr"]  # These don't need scaling
+  
+  # Topographic feature derivatives
+  enable_topographic_derivatives: true  # Calculate slope, aspect, curvature from DEM
+  enable_categorical_encoding: true  # CRITICAL: Enable proper landcover one-hot encoding
+
+# GRACE data configuration  
 grace_data_type: "mascon"
 grace_native_resolution_km: 55.66
+
+# ========== DATA PROCESSING SETTINGS ==========
+data_processing:
+  # Date ranges for all datasets - EXTENDED TO 2024 (Option 1: Maximum Data Integrity)
+  start_date: "2003-01-01"
+  end_date: "2024-12-01"  # EXTENDED: +24 months for overfitting reduction
+  
+  # Export settings
+  export_scale: 5000  # meters, consistent 5km resolution
+  
+  # Reference period for anomaly calculations
+  reference_period:
+    start: "2004-01"
+    end: "2009-12"
+
+# ========== GRACE PROCESSING SETTINGS ==========
+grace_processing:
+  # Raw GRACE spherical harmonic processing
+  raw_grace_resolution_deg: 3.0  # degrees (~300km)
+  
+  # Validation thresholds
+  mascon_extreme_threshold: 100    # cm water equivalent
+  raw_grace_extreme_threshold: 80  # cm water equivalent
+
+# ========== PATHS CONFIGURATION ==========
+paths:
+  # Base directories
+  base_dir: "data/raw"
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  models: "models"
+  results: "results"
+  figures: "figures"
+  
+  # Specific data directories
+  grace_dir: "data/raw/grace"
+  feature_stack: "data/processed/feature_stack.nc"
+  
+  # Input directories for feature datasets
+  input_dirs:
+    - data/raw/gldas/SoilMoi0_10cm_inst
+    - data/raw/gldas/SoilMoi10_40cm_inst
+    - data/raw/gldas/SoilMoi40_100cm_inst
+    - data/raw/gldas/SoilMoi100_200cm_inst
+    - data/raw/gldas/Evap_tavg
+    - data/raw/gldas/SWE_inst
+    - data/raw/chirps
+    - data/raw/terraclimate/pr
+    - data/raw/terraclimate/tmmn
+    - data/raw/terraclimate/tmmx
+    - data/raw/terraclimate/aet
+    - data/raw/terraclimate/def
+    - data/raw/modis_land_cover
+    - data/raw/openlandmap
+    - data/raw/usgs_dem

@@ -3,20 +3,49 @@ import os
 import ee
 import geemap
 from datetime import datetime
-from dataretrieval import nwis
-import pandas as pd
-
-# Initialize Earth Engine
 try:
-    ee.Initialize(project = 'ee-jsuhydrolabenb')
-except Exception as e:
-    ee.Authenticate()
-    ee.Initialize()
+    from dataretrieval import nwis
+    HAS_NWIS = True
+except ImportError:
+    HAS_NWIS = False
+    print("⚠️ dataretrieval not available - USGS well data functionality disabled")
+import pandas as pd
+from .config_manager import get_config
 
-# Study region: Mississippi River Basin (example bounding box)
-REGIONS = {
-    "mississippi": ee.Geometry.Rectangle([-113.94, 28.84, -77.84, 49.74])
-}
+# Earth Engine initialization state
+_ee_initialized = False
+
+def initialize_earth_engine():
+    """Initialize Earth Engine with lazy loading."""
+    global _ee_initialized
+    if _ee_initialized:
+        return
+    
+    try:
+        ee.Initialize(project='ee-sauravbhattarai1999')
+        _ee_initialized = True
+    except Exception as e:
+        try:
+            print("⚠️ Attempting Earth Engine authentication...")
+            ee.Authenticate()
+            ee.Initialize()
+            _ee_initialized = True
+        except Exception as auth_error:
+            raise RuntimeError(
+                f"Failed to initialize Earth Engine. Please ensure:\n"
+                f"1. You have authenticated with 'earthengine authenticate'\n"
+                f"2. Your project is registered for Earth Engine access\n"
+                f"Original error: {auth_error}"
+            )
+
+def get_region(region_name):
+    """Get region geometry, initializing EE if needed."""
+    initialize_earth_engine()
+    regions = {
+        "mississippi": ee.Geometry.Rectangle([-113.94, 28.84, -77.84, 49.74]),
+        "kansas": ee.Geometry.Rectangle([-99.0, 37.0, -96.0, 39.0])  # Test region from config
+    }
+    return regions.get(region_name)
 
 # Output directories
 RAW_DIR = "data/raw"
@@ -28,21 +57,24 @@ def ensure_dirs():
         os.makedirs(os.path.join(RAW_DIR, sub), exist_ok=True)
 
 def export_grace(region):
-    collection = ee.ImageCollection("NASA/GRACE/MASS_GRIDS_V04/MASCON_CRI") \
-        .select("lwe_thickness") \
-        .filterDate("2003-01-01", "2022-12-31") \
-        .filterBounds(region)
-
-    print("Exporting GRACE...")
-    geemap.ee_export_image_collection(
-        collection,
-        out_dir=os.path.join(RAW_DIR, "grace"),
-        scale=50000,
-        region=region,
-        file_per_band=False
-    )
+    """Export GRACE using task-based approach with monthly aggregation for temporal alignment"""
+    initialize_earth_engine()
+    from src.data_load.grace import submit_grace_monthly_export_tasks
+    
+    print("Submitting GRACE monthly export tasks to Google Earth Engine...")
+    print("This creates proper calendar month composites for temporal alignment.")
+    
+    try:
+        task_info = submit_grace_monthly_export_tasks(region, description_suffix="pipeline")
+        print(f"✅ GRACE monthly export task submitted successfully!")
+        print(f"Task will process ~240 monthly files asynchronously in Google Earth Engine.")
+        return task_info
+    except Exception as e:
+        print(f"❌ Failed to submit GRACE monthly export task: {e}")
+        raise
 
 def export_gldas(region):
+    initialize_earth_engine()
     print("Aggregating and exporting GLDAS monthly means...")
     variables = [
         "SoilMoi0_10cm_inst",
@@ -53,8 +85,13 @@ def export_gldas(region):
         "SWE_inst"
     ]
     for var in variables:
+        # Get date range and scale from config
+        start_date = get_config('data_processing.start_date', '2003-01-01')
+        end_date = get_config('data_processing.end_date', '2022-12-31')
+        scale = get_config('data_processing.export_scale', 5000)
+        
         monthly = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H") \
-            .filterDate("2003-01-01", "2022-12-31") \
+            .filterDate(start_date, end_date) \
             .filterBounds(region) \
             .select(var)
 
@@ -63,21 +100,34 @@ def export_gldas(region):
             end = start.advance(1, 'month')
             return monthly.filterDate(start, end).mean().set('system:time_start', start.millis())
 
-        months = ee.List.sequence(0, 12 * 20 - 1).map(lambda i: ee.Date("2003-01-01").advance(i, 'month'))
+        # Calculate months sequence from config dates
+        import datetime
+        start_dt = datetime.datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.datetime.strptime(end_date, '%Y-%m-%d')
+        n_years = end_dt.year - start_dt.year + 1
+        months = ee.List.sequence(0, 12 * n_years - 1).map(lambda i: ee.Date(start_date).advance(i, 'month'))
         monthly_collection = ee.ImageCollection(months.map(monthly_composite))
 
+        raw_dir = get_config('paths.raw_data', 'data/raw')
         geemap.ee_export_image_collection(
             monthly_collection,
-            out_dir=os.path.join(RAW_DIR, "gldas", var),
-            scale=25000,
+            out_dir=os.path.join(raw_dir, "gldas", var),
+            scale=scale,
             region=region,
             file_per_band=False
         )
 
 def export_chirps(region):
+    initialize_earth_engine()
     print("Aggregating and exporting CHIRPS monthly totals...")
+    # Get config values
+    start_date = get_config('data_processing.start_date', '2003-01-01')
+    end_date = get_config('data_processing.end_date', '2022-12-31')
+    scale = get_config('data_processing.export_scale', 5000)
+    raw_dir = get_config('paths.raw_data', 'data/raw')
+    
     collection = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY") \
-        .filterDate("2003-01-01", "2022-12-31") \
+        .filterDate(start_date, end_date) \
         .filterBounds(region)
 
     def monthly_sum(date):
@@ -85,35 +135,50 @@ def export_chirps(region):
         end = start.advance(1, 'month')
         return collection.filterDate(start, end).sum().set('system:time_start', start.millis())
 
-    months = ee.List.sequence(0, 12 * 20 - 1).map(lambda i: ee.Date("2003-01-01").advance(i, 'month'))
+    # Calculate months sequence from config dates
+    import datetime
+    start_dt = datetime.datetime.strptime(start_date, '%Y-%m-%d')
+    end_dt = datetime.datetime.strptime(end_date, '%Y-%m-%d')
+    n_years = end_dt.year - start_dt.year + 1
+    months = ee.List.sequence(0, 12 * n_years - 1).map(lambda i: ee.Date(start_date).advance(i, 'month'))
     monthly_collection = ee.ImageCollection(months.map(monthly_sum))
 
     geemap.ee_export_image_collection(
         monthly_collection,
-        out_dir=os.path.join(RAW_DIR, "chirps"),
-        scale=5000,
+        out_dir=os.path.join(raw_dir, "chirps"),
+        scale=scale,
         region=region,
         file_per_band=False
     )
 
 def export_modis_landcover(region):
-    collection = ee.ImageCollection("MODIS/061/MCD12Q1") \
-        .select("LC_Type1") \
-        .filterDate("2000-01-01", "2022-12-31") \
-        .filterBounds(region)
-
-    print("Exporting MODIS Land Cover...")
-    geemap.ee_export_image_collection(
-        collection,
-        out_dir=os.path.join(RAW_DIR, "modis_land_cover"),
-        scale=2000,
-        region=region,
-        file_per_band=False
-    )
+    """Export MODIS Land Cover using task-based approach for asynchronous processing"""
+    initialize_earth_engine()
+    from src.data_load.modis import submit_modis_export_task
+    
+    print("Submitting MODIS Land Cover export task to Google Earth Engine...")
+    print("This will create an asynchronous task for processing.")
+    
+    try:
+        scale = get_config('data_processing.export_scale', 5000)
+        task_info = submit_modis_export_task(region, scale=scale, description_suffix="pipeline")
+        print(f"✅ MODIS Land Cover export task submitted successfully!")
+        print(f"Task will be processed asynchronously in Google Earth Engine.")
+        return task_info
+    except Exception as e:
+        print(f"❌ Failed to submit MODIS Land Cover export task: {e}")
+        raise
 
 def export_terraclimate(region):
+    initialize_earth_engine()
+    # Get config values
+    start_date = get_config('data_processing.start_date', '2003-01-01')
+    end_date = get_config('data_processing.end_date', '2022-12-31')
+    scale = get_config('data_processing.export_scale', 5000)
+    raw_dir = get_config('paths.raw_data', 'data/raw')
+    
     collection = ee.ImageCollection("IDAHO_EPSCOR/TERRACLIMATE") \
-        .filterDate("2003-01-01", "2022-12-31") \
+        .filterDate(start_date, end_date) \
         .filterBounds(region)
 
     bands = ["tmmx", "tmmn", "pr", "aet", "def"]
@@ -123,22 +188,29 @@ def export_terraclimate(region):
         subset = collection.select(band)
         geemap.ee_export_image_collection(
             subset,
-            out_dir=os.path.join(RAW_DIR, "terraclimate", band),
-            scale=4000,
+            out_dir=os.path.join(raw_dir, "terraclimate", band),
+            scale=scale,
             region=region,
             file_per_band=False
         )
 
 def export_usgs_dem(region):
-    dem = ee.Image("USGS/SRTMGL1_003").select("elevation")
-
-    print("Exporting USGS DEM...")
-    geemap.ee_export_image(
-        dem,
-        filename=os.path.join(RAW_DIR, "usgs_dem", "srtm_dem.tif"),
-        scale=800,
-        region=region
-    )
+    """Export DEM using task-based approach for asynchronous processing"""
+    initialize_earth_engine()
+    from src.data_load.dem import submit_dem_export_task
+    
+    print("Submitting DEM export task to Google Earth Engine...")
+    print("This will create an asynchronous task for processing.")
+    
+    try:
+        scale = get_config('data_processing.export_scale', 5000)
+        task_info = submit_dem_export_task(region, scale=scale, description_suffix="pipeline")
+        print(f"✅ DEM export task submitted successfully!")
+        print(f"Task will be processed asynchronously in Google Earth Engine.")
+        return task_info
+    except Exception as e:
+        print(f"❌ Failed to submit DEM export task: {e}")
+        raise
 
 def download_usgs_well_data():
     """Download ALL available USGS well data with comprehensive coverage"""
@@ -152,9 +224,10 @@ def download_usgs_well_data():
     print("🔧 Realistic quality control for irregular groundwater sampling")
     print("⏱️  This may take 30-60 minutes for comprehensive coverage...")
     
-    # SAME reference period as GRACE
-    REFERENCE_START = "2004-01"
-    REFERENCE_END = "2009-12"
+    # Get reference period from config
+    REFERENCE_START = get_config('data_processing.reference_period.start', '2004-01')
+    REFERENCE_END = get_config('data_processing.reference_period.end', '2009-12')
+    raw_dir = get_config('paths.raw_data', 'data/raw')
     
     states = ['MS', 'AR', 'LA', 'TN', 'MO', 'KY', 'IL', 'IN', 'OH', 'AL', 
               'WV', 'PA', 'MN', 'WI', 'IA', 'ND', 'SD', 'NE', 'KS', 'OK', 
@@ -363,12 +436,12 @@ def download_usgs_well_data():
     print("💾 Saving comprehensive well time series data...")
     combined_df = pd.concat(all_data, axis=1)
     combined_df.index.name = 'Date'
-    combined_df.to_csv(os.path.join(RAW_DIR, "usgs_well_data", "monthly_groundwater_anomalies_cm.csv"))
+    combined_df.to_csv(os.path.join(raw_dir, "usgs_well_data", "monthly_groundwater_anomalies_cm.csv"))
     
     # Save comprehensive metadata
     print("💾 Saving comprehensive well metadata...")
     metadata_df = pd.DataFrame(well_metadata)
-    metadata_df.to_csv(os.path.join(RAW_DIR, "usgs_well_data", "well_metadata.csv"), index=False)
+    metadata_df.to_csv(os.path.join(raw_dir, "usgs_well_data", "well_metadata.csv"), index=False)
     
     print(f"\n✅ SAVED COMPREHENSIVE DATASET:")
     print(f"   - Time series: monthly_groundwater_anomalies_cm.csv")
@@ -413,6 +486,7 @@ def download_usgs_well_data():
     return len(all_data)  # Return number of wells for pipeline tracking
 
 def export_openlandmap_soil(region):
+    initialize_earth_engine()
     datasets = {
         'clay': 'OpenLandMap/SOL/SOL_CLAY-WFRACTION_USDA-3A1A1A_M/v02',
         'sand': 'OpenLandMap/SOL/SOL_SAND-WFRACTION_USDA-3A1A1A_M/v02',
@@ -421,48 +495,70 @@ def export_openlandmap_soil(region):
     depths = {
         '0cm': 'b0',
         '10cm': 'b10',
-        '30cm': 'b30',
+        '30cm': 'b30',  # Focus on most relevant depths for groundwater
         '60cm': 'b60',
         '100cm': 'b100',
         '200cm': 'b200'
     }
+    
     for prop, asset_id in datasets.items():
         for depth_label, band_name in depths.items():
-            print(f"Exporting {prop} at {depth_label}")
+            print(f"Exporting {prop} at {depth_label} (5km resolution)")
             try:
-                img = ee.Image(asset_id).select(band_name).clip(region).reproject(crs='EPSG:4326', scale=250)
+                img = ee.Image(asset_id).select(band_name)
+                
+                # Resample to 5km using mean
+                img_5km = img.reduceResolution(
+                    reducer=ee.Reducer.mean(),
+                    maxPixels=1024
+                )
+                
+                raw_dir = get_config('paths.raw_data', 'data/raw')
+                scale = get_config('data_processing.export_scale', 5000)
                 geemap.ee_export_image(
-                    img,
-                    filename=os.path.join(RAW_DIR, "openlandmap", f"{prop}_{depth_label}.tif"),
-                    scale=750,
-                    region=region.bounds()
+                    img_5km,
+                    filename=os.path.join(raw_dir, "openlandmap", f"{prop}_{depth_label}_5km.tif"),
+                    scale=scale,
+                    region=region
                 )
             except Exception as e:
                 print(f"Failed to export {prop} at {depth_label}: {e}")
 
 def export_landscan(region):
     """Export LandScan Global Population Dataset for the study region"""
+    initialize_earth_engine()
     print("Exporting LandScan Global Population Dataset...")
+    
+    # Get config values
+    start_date = get_config('data_processing.start_date', '2003-01-01')
+    end_date = get_config('data_processing.end_date', '2022-12-31')
+    scale = get_config('data_processing.export_scale', 5000)
+    raw_dir = get_config('paths.raw_data', 'data/raw')
     
     # Get the collection and filter to our study period
     collection = ee.ImageCollection("projects/sat-io/open-datasets/ORNL/LANDSCAN_GLOBAL") \
-        .filterDate("2003-01-01", "2022-12-31") \
+        .filterDate(start_date, end_date) \
         .filterBounds(region) \
         .select("b1")
     
-    # Export each year's data
-    for year in range(2003, 2023):
+    # Export each year's data based on config date range
+    start_year = int(start_date[:4])
+    end_year = int(end_date[:4])
+    for year in range(start_year, end_year + 1):
         print(f"Processing year {year}...")
         try:
             # Get image for this year
             img = collection.filter(ee.Filter.calendarRange(year, year, 'year')).first()
             
-            # Export the image
+            # Export the image with sum reducer to preserve population counts
             filename = f"{year}.tif"
             geemap.ee_export_image(
-                img,
-                filename=os.path.join(RAW_DIR, "landscan", filename),
-                scale=1000,  # 1km resolution as specified
+                img.reduceResolution(
+                    reducer=ee.Reducer.sum(),
+                    maxPixels=1024
+                ),
+                filename=os.path.join(raw_dir, "landscan", filename),
+                scale=scale,
                 region=region
             )
             print(f"✅ Exported {filename}")
@@ -472,18 +568,20 @@ def export_landscan(region):
     print("✅ LandScan export complete")
 
 def main():
+    # Get available datasets from config
+    all_datasets = get_config('download.default_datasets', ["grace", "gldas", "chirps", "modis", "terraclimate", "dem", "usgs", "openlandmap", "landscan"])
+    default_region = get_config('download.default_region', 'mississippi')
+    
     parser = argparse.ArgumentParser(description="Download datasets for GRACE downscaling")
-    parser.add_argument("--download", nargs="+", choices=ALL_DATASETS + ["all"], required=True, help="Datasets to download")
-    parser.add_argument("--region", type=str, default="mississippi", help="Region name (default: mississippi)")
+    parser.add_argument("--download", nargs="+", choices=all_datasets + ["all"], required=True, help="Datasets to download")
+    parser.add_argument("--region", type=str, default=default_region, help=f"Region name (default: {default_region})")
     args = parser.parse_args()
 
-    region = REGIONS.get(args.region.lower())
-    if not region:
-        raise ValueError(f"Unknown region: {args.region}")
-
+    region = get_region(args.region.lower())
+    
     ensure_dirs()
 
-    datasets_to_download = ALL_DATASETS if "all" in args.download else args.download
+    datasets_to_download = all_datasets if "all" in args.download else args.download
 
     if "grace" in datasets_to_download:
         export_grace(region)

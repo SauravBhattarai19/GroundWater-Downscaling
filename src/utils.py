@@ -77,26 +77,81 @@ def match_resolution(src, match):
     """Alias: Match CRS, resolution, and alignment."""
     return reproject_match(src, match)
 
-def parse_grace_months(grace_dir):
-    """Parse valid GRACE months from filename ranges."""
+def parse_grace_months(grace_dir=None):
+    """Parse valid GRACE months from various filename formats."""
+    if grace_dir is None:
+        grace_dir = get_config('paths.grace_dir', 'data/raw/grace')
+    """Parse valid GRACE months from various filename formats."""
     months = set()
-    pattern = re.compile(r"(\d{8})_(\d{8})\.tif$")
+    
+    # Check for new numeric format (0.tif, 1.tif, 2.tif...) - like GLDAS/CHIRPS
+    numeric_pattern = re.compile(r"(\d+)\.tif$")
+    # Check for yyyymm format (200301.tif, 200302.tif...)
+    monthly_pattern = re.compile(r"(\d{6})\.tif$")
+    # Check for old irregular format (YYYYMMDD_YYYYMMDD.tif) for backward compatibility
+    range_pattern = re.compile(r"(\d{8})_(\d{8})\.tif$")
     
     if not os.path.exists(grace_dir):
         print(f"⚠️ GRACE directory not found: {grace_dir}")
         return []
+    
+    files = os.listdir(grace_dir)
+    numeric_files = []
+    monthly_files = 0
+    range_files = 0
+    
+    for fname in files:
+        # Try new numeric format first (0.tif, 1.tif, 2.tif...)
+        match = numeric_pattern.match(fname)
+        if match and not monthly_pattern.match(fname):  # Exclude yyyymm which also matches numeric
+            numeric_files.append(int(match.group(1)))
+            continue
         
-    for fname in os.listdir(grace_dir):
-        match = pattern.match(fname)
+        # Try yyyymm format (200301.tif, 200302.tif...)
+        match = monthly_pattern.match(fname)
+        if match:
+            yyyymm = match.group(1)
+            # Convert YYYYMM to YYYY-MM format
+            year = yyyymm[:4]
+            month = yyyymm[4:6]
+            months.add(f"{year}-{month}")
+            monthly_files += 1
+            continue
+        
+        # Fall back to old irregular format for backward compatibility
+        match = range_pattern.match(fname)
         if match:
             start = pd.to_datetime(match.group(1), format="%Y%m%d")
             end = pd.to_datetime(match.group(2), format="%Y%m%d")
-            # Include months between start and end (but pick mid-month)
+            # Include months between start and end (but pick mid-point)
             mid = start + (end - start) / 2
             months.add(mid.strftime("%Y-%m"))
+            range_files += 1
+    
+    # Handle numeric files (convert indices to YYYY-MM format)
+    if numeric_files:
+        # Sort numeric files and convert to months starting from config start date
+        numeric_files.sort()
+        start_date = get_config('data_processing.start_date', '2003-01-01')
+        base_date = pd.to_datetime(start_date)
+        
+        for file_idx in numeric_files:
+            # Each file represents one month starting from 2003-01
+            month_date = base_date + pd.DateOffset(months=file_idx)
+            months.add(month_date.strftime("%Y-%m"))
+        
+        print(f"✅ Using new numeric GRACE format: {len(numeric_files)} files (2003-01 to {(base_date + pd.DateOffset(months=max(numeric_files))).strftime('%Y-%m')})")
+    elif monthly_files > 0:
+        print(f"✅ Using YYYYMM GRACE format: {monthly_files} files")
+    elif range_files > 0:
+        print(f"⚠️ Using legacy GRACE format: {range_files} files (consider re-downloading)")
+    
     return sorted(months)
 
-def load_timestamp_map(grace_dir):
+def load_timestamp_map(grace_dir=None):
+    """Load grace-based timestamp map for masking/filtering."""
+    if grace_dir is None:
+        grace_dir = get_config('paths.grace_dir', 'data/raw/grace')
     """Load grace-based timestamp map for masking/filtering."""
     valid_months = parse_grace_months(grace_dir)
     return set(valid_months)
@@ -308,7 +363,7 @@ def print_resampling_summary():
     
     if GRACE_DATA_TYPE == "mascon":
         print("  🎯 Using JPL Mascon RL06.3Mv04:")
-        print(f"    - Native resolution: {MASCON_RESOLUTION_KM} km")
+        print(f"    - Native resolution: {get_config('grace_native_resolution_km', 55.66)} km")
         print("    - Already includes geophysical constraints")
         print("    - NO additional smoothing applied")
         print("    - Preserves all JPL processing benefits")

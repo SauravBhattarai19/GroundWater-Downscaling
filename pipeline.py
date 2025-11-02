@@ -83,20 +83,36 @@ import traceback
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-# Import pipeline modules
-from data_loader import main as download_data
-from features import main as create_features
+# Import centralized config manager
+from src.config_manager import get_config
 
-# Import both old and new model training approaches
+# Import unified model manager (always needed)
+from src.model_manager import ModelManager
+
+# Import other modules conditionally to avoid missing dependencies
 try:
-    from model_manager import ModelManager
-    HAS_MODEL_MANAGER = True
-except ImportError:
-    HAS_MODEL_MANAGER = False
-    print("⚠️ Advanced model manager not available. Using single-model mode.")
+    from src.data_loader import main as download_data
+    HAS_DATA_LOADER = True
+except ImportError as e:
+    print(f"⚠️ Data loader not available: {e}")
+    HAS_DATA_LOADER = False
+    download_data = None
 
-from updated_model_rf import main as train_single_model
-from groundwater_enhanced import calculate_groundwater_storage
+try:
+    from src.features import main as create_features
+    HAS_FEATURES = True
+except ImportError as e:
+    print(f"⚠️ Features module not available: {e}")
+    HAS_FEATURES = False
+    create_features = None
+
+try:
+    from src.groundwater_enhanced import calculate_groundwater_storage
+    HAS_GROUNDWATER = True
+except ImportError as e:
+    print(f"⚠️ Groundwater module not available: {e}")
+    HAS_GROUNDWATER = False
+    calculate_groundwater_storage = None
 
 
 def setup_logging():
@@ -121,7 +137,18 @@ def setup_logging():
 
 def check_requirements():
     """Check if all required directories and files exist."""
-    required_dirs = ["data/raw", "data/processed", "models", "results", "figures"]
+    # Get directory paths from config
+    try:
+        required_dirs = [
+            get_config('paths.raw_data', 'data/raw'),
+            get_config('paths.processed_data', 'data/processed'),
+            get_config('paths.models', 'models'),
+            get_config('paths.results', 'results'),
+            get_config('paths.figures', 'figures')
+        ]
+    except:
+        # Fallback to hardcoded values if config not available yet
+        required_dirs = ["data/raw", "data/processed", "models", "results", "figures"]
     
     for dir_path in required_dirs:
         Path(dir_path).mkdir(exist_ok=True, parents=True)
@@ -157,13 +184,50 @@ def load_config():
     return config
 
 
-def run_download_step(logger):
+def run_download_step(logger, datasets=None, region=None, use_test_region=False):
     """Download satellite data."""
     logger.info("STEP 1: Downloading satellite data...")
     
+    if not HAS_DATA_LOADER:
+        logger.error("❌ Data loader not available. Install missing dependencies.")
+        return False
+    
+    # Determine datasets to download
+    if datasets is None:
+        datasets = 'all'
+    else:
+        # Convert list to comma-separated string if needed
+        if isinstance(datasets, list):
+            datasets = ','.join(datasets)
+    
+    # Determine region to use
+    if use_test_region:
+        region_name = get_config('download.regions.kansas.name', 'kansas').lower().replace(' ', '_').replace('_', '')[:10]
+        if 'kansas' in region_name.lower():
+            region_name = 'kansas'
+        logger.info(f"Using test region: {region_name}")
+    elif region:
+        region_name = region
+        logger.info(f"Using specified region: {region}")
+    else:
+        region_name = get_config('download.default_region', 'mississippi')  
+        logger.info(f"Using default region: {region_name}")
+    
+    logger.info(f"Downloading datasets: {datasets}")
+    
     try:
         # Set up arguments for data_loader
-        sys.argv = ['data_loader.py', '--download', 'all', '--region', 'mississippi']
+        download_args = ['data_loader.py', '--download']
+        
+        # Add datasets (split by comma if multiple)
+        if datasets == 'all':
+            download_args.append('all')
+        else:
+            download_args.extend(datasets.split(','))
+        
+        download_args.extend(['--region', region_name])
+        
+        sys.argv = download_args
         download_data()
         logger.info("✅ Data download completed successfully")
         return True
@@ -176,6 +240,10 @@ def run_download_step(logger):
 def run_features_step(logger):
     """Create feature stack."""
     logger.info("STEP 2: Creating feature stack...")
+    
+    if not HAS_FEATURES:
+        logger.error("❌ Features module not available. Install missing dependencies.")
+        return False
     
     try:
         create_features()
@@ -191,66 +259,48 @@ def run_train_step(logger, config, models_to_train=None, single_model=None, ense
     """Train machine learning model(s)."""
     logger.info("STEP 3: Training machine learning model(s)...")
     
-    # Determine training mode
-    use_multi_model = (HAS_MODEL_MANAGER and 
-                      single_model is None and 
-                      len(config['models'].get('enabled', [])) > 0)
-    
-    if single_model:
-        logger.info(f"🔧 Single-model mode: {single_model}")
-        use_multi_model = False
-    elif ensemble_only:
-        logger.info("🔧 Ensemble-only mode")
-        use_multi_model = True
-    elif not HAS_MODEL_MANAGER:
-        logger.info("🔧 Fallback to single Random Forest model")
-        use_multi_model = False
-    
     try:
-        if use_multi_model:
-            logger.info("🚀 Multi-model training mode")
-            
-            # Initialize model manager
-            manager = ModelManager()
-            
-            # Prepare data
-            logger.info("📦 Preparing training data...")
-            X, y, feature_names, metadata = manager.prepare_data()
-            
-            # Determine which models to train
-            if models_to_train:
-                enabled_models = models_to_train
-                logger.info(f"Training specified models: {enabled_models}")
-            elif ensemble_only:
-                enabled_models = config['models'].get('enabled', ['rf', 'xgb', 'lgb'])
-                logger.info(f"Training all models for ensemble: {enabled_models}")
-            else:
-                enabled_models = config['models'].get('enabled', ['rf'])
-                logger.info(f"Training configured models: {enabled_models}")
-            
-            # Train models with proper metadata for data leakage prevention
-            logger.info("🔄 Using temporal splitting to prevent data leakage")
-            results = manager.train_all_models(X, y, metadata, enabled_models=enabled_models)
-            
-            # Save models and results
-            manager.save_models()
-            
-            # Create comparison plots
-            manager.create_comparison_plots()
-            
-            # Log summary
-            if len(results) > 0:
-                logger.info("📊 Model training results:")
-                for _, row in results.iterrows():
-                    logger.info(f"  {row['display_name']}: R² = {row['test_r2']:.4f}, "
-                              f"RMSE = {row['test_rmse']:.4f}")
-                
-                best_model = results.loc[results['test_r2'].idxmax(), 'display_name']
-                logger.info(f"🏆 Best model: {best_model}")
-            
+        # Initialize model manager
+        logger.info("🚀 Unified model training with ModelManager")
+        manager = ModelManager()
+        
+        # Prepare data
+        logger.info("📦 Preparing training data...")
+        X, y, feature_names, metadata = manager.prepare_data()
+        
+        # Determine which models to train
+        if models_to_train:
+            enabled_models = models_to_train
+            logger.info(f"Training specified models: {enabled_models}")
+        elif ensemble_only:
+            enabled_models = config['models'].get('enabled', ['rf', 'xgb', 'lgb'])
+            logger.info(f"Training all models for ensemble: {enabled_models}")
+        elif single_model:
+            enabled_models = [single_model]
+            logger.info(f"Training single model: {single_model}")
         else:
-            logger.info("🔧 Single-model training mode (Random Forest)")
-            train_single_model()
+            enabled_models = config['models'].get('enabled', ['rf'])
+            logger.info(f"Training configured models: {enabled_models}")
+        
+        # Train models with proper metadata for data leakage prevention
+        logger.info("🔄 Using temporal splitting to prevent data leakage")
+        results = manager.train_all_models(X, y, metadata, enabled_models=enabled_models)
+        
+        # Save models and results
+        manager.save_models()
+        
+        # Create comparison plots
+        manager.create_comparison_plots()
+        
+        # Log summary
+        if len(results) > 0:
+            logger.info("📊 Model training results:")
+            for _, row in results.iterrows():
+                logger.info(f"  {row['display_name']}: R² = {row['test_r2']:.4f}, "
+                          f"RMSE = {row['test_rmse']:.4f}")
+            
+            best_model = results.loc[results['test_r2'].idxmax(), 'display_name']
+            logger.info(f"🏆 Best model: {best_model}")
         
         logger.info("✅ Model training completed successfully")
         return True
@@ -264,6 +314,10 @@ def run_train_step(logger, config, models_to_train=None, single_model=None, ense
 def run_groundwater_step(logger, config):
     """Calculate groundwater storage."""
     logger.info("STEP 4: Calculating groundwater storage...")
+    
+    if not HAS_GROUNDWATER:
+        logger.error("❌ Groundwater module not available. Install missing dependencies.")
+        return False
     
     try:
         # Enhanced groundwater calculation can automatically detect and use the best model
@@ -368,6 +422,25 @@ def main():
         '--skip-download',
         action='store_true',
         help='Skip download step even if included in steps'
+    )
+    
+    # NEW: Dataset selection arguments
+    parser.add_argument(
+        '--datasets',
+        type=str,
+        help='Comma-separated list of datasets to download (grace,gldas,chirps,terraclimate,modis,dem,openlandmap,landscan,all). Default: all'
+    )
+    
+    parser.add_argument(
+        '--region',
+        type=str,
+        help='Region to download data for (mississippi, kansas, etc.). Default: mississippi'
+    )
+    
+    parser.add_argument(
+        '--test-region',
+        action='store_true',
+        help='Use test region from config.yaml instead of main region'
     )
     
     # NEW: Model selection arguments
@@ -480,15 +553,13 @@ def main():
             logger.info(f"Model mode: Single model ({args.single_model})")
         elif args.ensemble_only:
             logger.info("Model mode: Ensemble of all available models")
-        elif HAS_MODEL_MANAGER:
+        else:
             enabled = config['models'].get('enabled', ['rf'])
             logger.info(f"Model mode: Multi-model ({enabled})")
-        else:
-            logger.info("Model mode: Single Random Forest (fallback)")
     
     # Execute steps
     step_functions = {
-        'download': lambda: run_download_step(logger),
+        'download': lambda: run_download_step(logger, args.datasets, args.region, args.test_region),
         'features': lambda: run_features_step(logger),
         'train': lambda: run_train_step(logger, config, models_to_train, 
                                        args.single_model, args.ensemble_only),
@@ -520,10 +591,11 @@ def main():
         # Print final outputs
         logger.info("\n" + "="*60)
         logger.info("PIPELINE OUTPUTS:")
-        logger.info("  - Feature stack: data/processed/feature_stack.nc")
+        feature_stack_path = get_config('paths.feature_stack', 'data/processed/feature_stack.nc')
+        logger.info(f"  - Feature stack: {feature_stack_path}")
         
         # Model outputs (varies by training mode)
-        models_dir = Path("models")
+        models_dir = Path(get_config('paths.models', 'models'))
         if models_dir.exists():
             model_files = list(models_dir.glob("*_model.joblib"))
             if model_files:
@@ -535,9 +607,11 @@ def main():
             if comparison_file.exists():
                 logger.info(f"  - Model comparison: {comparison_file}")
         
-        logger.info("  - Groundwater data: results/groundwater_storage_anomalies.nc")
-        logger.info("  - Validation metrics: results/validation/")
-        logger.info("  - Figures: figures/")
+        results_dir = get_config('paths.results', 'results')
+        figures_dir = get_config('paths.figures', 'figures')
+        logger.info(f"  - Groundwater data: {results_dir}/groundwater_storage_anomalies.nc")
+        logger.info(f"  - Validation metrics: {results_dir}/validation/")
+        logger.info(f"  - Figures: {figures_dir}/")
         logger.info("="*60)
         
         return 0
