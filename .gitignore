@@ -1,0 +1,104 @@
+# ===========================================
+# GRACE Downscaling Pipeline - .gitignore
+# ===========================================
+
+# ===== Data & Processing Output =====
+# Large processed data files (NetCDF, etc.)
+processed_coarse_to_fine/
+data/
+*.nc
+*.tif
+*.tiff
+
+# ===== Model Files =====
+# Trained models (large binary files)
+models_coarse_to_fine*/
+models/
+*.joblib
+*.pkl
+*.h5
+*.pt
+*.pth
+
+# ===== Results & Figures =====
+# Generated outputs
+results_coarse_to_fine/
+results/
+figures_coarse_to_fine/
+figures_shap/
+figures/
+
+# ===== Logs =====
+logs_coarse_to_fine/
+logs/
+*.log
+
+# ===== Backups =====
+backup_*/
+backups/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ===== Virtual Environments =====
+venv/
+ENV/
+env/
+.venv/
+
+# ===== IDE & Editor =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+*.ipynb
+
+# ===== OS Files =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ===== Sensitive Files =====
+TOKEN.txt
+*.token
+*credentials*
+*secret*
+
+# ===== Misc =====
+*.tmp
+*.temp
+*.bak
+.cache/
+

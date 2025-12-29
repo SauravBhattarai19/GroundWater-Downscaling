@@ -1,0 +1,399 @@
+paths:
+  feature_stack_fine: processed_coarse_to_fine/feature_stack_5km.nc
+  grace_raw: data/raw/grace
+  processed_data: processed_coarse_to_fine
+  feature_stack_coarse: processed_coarse_to_fine/feature_stack_55km.nc
+  grace_filled: processed_coarse_to_fine/grace_filled_stl.nc
+  models: models_coarse_to_fine_simple
+  results: results_coarse_to_fine
+  figures: figures_coarse_to_fine
+  logs: logs_coarse_to_fine
+  predictions_coarse: processed_coarse_to_fine/predictions_55km.nc
+  predictions_fine: processed_coarse_to_fine/predictions_5km.nc
+  residuals_coarse: processed_coarse_to_fine/residuals_55km.nc
+  residuals_fine: processed_coarse_to_fine/residuals_5km.nc
+  final_downscaled: results_coarse_to_fine/grace_downscaled_5km.nc
+resolution:
+  grace_native_km: 55.66
+  grace_native_deg: 0.5
+  fine_resolution_km: 5
+  fine_resolution_deg: 0.05
+  aggregation_factor: 11
+spatial_bounds:
+  north: 51.5
+  south: 28.5
+  east: -77.5
+  west: -114.0
+  expected_lat_points: 46
+  expected_lon_points: 73
+  total_points: 3358
+  apply_spatial_clipping: true
+  buffer_degrees: 0.0
+  validate_bounds: true
+  warn_if_global: true
+grace_scale_factors:
+  apply_scale_factors: true
+  scale_factor_file: data/JPL_MSCNv04_CRImascon_ScaleFactors.nc
+  interpolation_method: nearest
+  validate_application: true
+  description: JPL GRACE RL06.3v04 CRI scale factors for amplitude restoration and
+    leakage correction
+  reference: https://podaac.jpl.nasa.gov/dataset/TELLUS_GRAC-GRFO_MASCON_CRI_GRID_RL06.3_V4
+grace_gap_filling:
+  method: stl
+  train_fraction: 0.8
+  seasonal_period: 12
+  seasonal_deg: 1
+  trend_deg: 1
+  low_pass_deg: 1
+  robust: true
+  use_vectorized: true
+  fill_threshold: 0.5
+  interpolate_short_gaps: true
+  max_gap_length: 3
+feature_aggregation:
+  enable_advanced_features: true
+  enable_multiscale_training: true
+  fine_scale_sample_fraction: 0.1
+  aggregation_methods:
+    mean:
+    - SoilMoi.*
+    - Evap_tavg
+    - pr
+    - tmmn
+    - tmmx
+    - aet
+    - def
+    - SWE_inst
+    - elevation
+    - slope
+    - aspect
+    - curvature
+    - topo_.*
+    - .*_mean
+    - .*_anomaly
+    - population_density
+    - soil_.*
+    - sand_.*
+    - clay_.*
+    mode:
+    - land_cover.*
+    - modis_.*
+    sum:
+    - population_count
+    - landscan_population
+  mask_by_grace: true
+  chunk_size: 50
+models:
+  enabled:
+  - xgb
+  - lgb
+  - nn
+  ensemble:
+    method: weighted
+    weight_metric: cv_r2
+    min_weight: 0.05
+  cross_validation:
+    method: blocked_spatiotemporal
+    n_spatial_blocks: 5
+    n_temporal_blocks: 4
+    spatial_buffer_deg: 0.5
+    temporal_buffer_months: 1
+    n_folds_expected: 20
+  simple_split:
+    train_fraction: 0.7
+    test_fraction: 0.3
+    random_state: 42
+    stratify: false
+    shuffle: true
+    description: Traditional 70-30 train/test split - faster but may have spatial/temporal
+      leakage
+  scaling:
+    method: robust
+    models_needing_scaling:
+    - nn
+    - svr
+  hyperparameters:
+    rf:
+      n_estimators: 500
+      max_depth: 25
+      min_samples_split: 50
+      min_samples_leaf: 25
+      max_features: log2
+      max_samples: 0.8
+      n_jobs: 16
+      random_state: 42
+    xgb:
+      n_estimators: 500
+      max_depth: 10
+      learning_rate: 0.05
+      subsample: 0.85
+      reg_alpha: 0.1
+      reg_lambda: 0.1
+      colsample_bytree: 0.8
+      n_jobs: 96
+      random_state: 42
+      tree_method: hist
+    lgb:
+      n_estimators: 1000
+      max_depth: -1
+      num_leaves: 128
+      min_child_samples: 50
+      learning_rate: 0.05
+      subsample: 0.85
+      reg_alpha: 0.1
+      reg_lambda: 0.1
+      feature_fraction: 0.8
+      bagging_fraction: 0.85
+      bagging_freq: 5
+      n_jobs: 96
+      random_state: 42
+      verbose: -1
+    nn:
+      hidden_layer_sizes:
+      - 512
+      - 256
+      - 128
+      max_iter: 2000
+      early_stopping: true
+      validation_fraction: 0.1
+      alpha: 0.001
+      learning_rate_init: 0.001
+      batch_size: 1024
+      random_state: 42
+residual_correction:
+  enabled: true
+  calculate_at_scale: 55
+  interpolation_method: distance_weighted_nearest
+  smooth_residuals: true
+  smoothing_sigma: 1.0
+  clip_residuals: true
+  residual_max_std: 3.0
+  auto_selected: true
+  selection_timestamp: '2025-11-25T09:51:05.966993'
+data_processing:
+  start_date: '2003-01-01'
+  end_date: '2024-12-31'
+  reference_period:
+    start: 2004-01
+    end: 2009-12
+  grace_valid_range:
+  - -100
+  - 100
+  feature_valid_ranges:
+    temperature:
+    - -50
+    - 50
+    precipitation:
+    - 0
+    - 500
+    soil_moisture:
+    - 0
+    - 1
+    evapotranspiration:
+    - 0
+    - 200
+parallelization:
+  max_cores_total: 120
+  cv_n_jobs: 12
+  model_n_jobs: 10
+  io_n_jobs: 16
+  chunk_time_size: 50
+  chunk_spatial_size: 1000
+  verbose: true
+  progress_bar: true
+validation:
+  enable_well_validation: true
+  well_buffer_km: 10
+  well_data_path: data/raw/usgs_well_data
+  metrics:
+  - r2
+  - rmse
+  - mae
+  - bias
+  - correlation
+  validation_zones:
+  - full_domain
+  - high_grace_quality
+  - well_locations
+visualization:
+  dpi: 300
+  figsize:
+  - 12
+  - 8
+  cmap: RdBu_r
+  plots:
+  - spatial_maps
+  - time_series
+  - scatter_plots
+  - residual_analysis
+  - cv_results
+  - model_comparison
+  - feature_importance
+  example_locations:
+  - - 39.0
+    - -98.0
+  - - 35.0
+    - -90.0
+  - - 42.0
+    - -95.0
+hyperparameter_tuning:
+  enabled: true
+  study_name: grace_downscaling_optimization
+  storage_url: sqlite:///models_coarse_to_fine/optuna_studies.db
+  direction: maximize
+  n_trials: 50
+  timeout: 7200
+  n_startup_trials: 20
+  n_jobs: 1
+  show_progress_bar: true
+  tuning_cv:
+    method: simple_split
+    train_fraction: 0.7
+    validation_fraction: 0.15
+    test_fraction: 0.15
+    random_state: 42
+  multi_objective:
+    enabled: false
+    objectives:
+    - r2
+    - training_time
+    weights:
+    - 0.8
+    - 0.2
+  search_spaces:
+    xgb:
+      n_estimators:
+      - 100
+      - 2000
+      max_depth:
+      - 3
+      - 15
+      learning_rate:
+      - 0.01
+      - 0.3
+      subsample:
+      - 0.6
+      - 1.0
+      colsample_bytree:
+      - 0.6
+      - 1.0
+      reg_alpha:
+      - 0.0
+      - 10.0
+      reg_lambda:
+      - 0.0
+      - 10.0
+      min_child_weight:
+      - 1
+      - 20
+      gamma:
+      - 0.0
+      - 5.0
+    rf:
+      n_estimators:
+      - 100
+      - 2000
+      max_depth:
+      - 5
+      - 50
+      min_samples_split:
+      - 2
+      - 100
+      min_samples_leaf:
+      - 1
+      - 50
+      max_features:
+      - sqrt
+      - log2
+      - 0.3
+      - 0.5
+      - 0.7
+      - 0.9
+      max_samples:
+      - 0.5
+      - 1.0
+      bootstrap:
+      - true
+      - false
+    lgb:
+      n_estimators:
+      - 100
+      - 2000
+      max_depth:
+      - -1
+      - 30
+      num_leaves:
+      - 10
+      - 300
+      learning_rate:
+      - 0.01
+      - 0.3
+      feature_fraction:
+      - 0.4
+      - 1.0
+      bagging_fraction:
+      - 0.4
+      - 1.0
+      bagging_freq:
+      - 0
+      - 10
+      min_child_samples:
+      - 5
+      - 100
+      reg_alpha:
+      - 0.0
+      - 10.0
+      reg_lambda:
+      - 0.0
+      - 10.0
+      min_split_gain:
+      - 0.0
+      - 1.0
+  early_stopping:
+    enabled: true
+    patience: 50
+    min_trials: 100
+  results:
+    save_study: true
+    save_best_params: true
+    generate_plots: true
+    compare_with_default: true
+  shap_analysis:
+    enabled: true
+    sample_size: 1000
+    plot_types:
+    - summary
+    - waterfall
+    - bar
+    - heatmap
+    interaction_analysis: false
+    feature_clustering: true
+    save_plots: true
+    save_values: true
+  monitoring:
+    memory_limit_gb: 32
+    cpu_limit_percent: 90
+    log_level: INFO
+    save_intermediate_results: true
+    checkpoint_frequency: 20
+scientific:
+  grace_units: cm
+  output_units: cm
+  add_metadata: true
+  metadata:
+    institution: ORISE/NASA
+    source: GRACE Mascon + Multi-source covariates
+    method: Coarse-to-fine ML downscaling with residual correction
+    references: Similar to Yin et al. (2018) approach
+  compute_uncertainty: true
+  uncertainty_method: ensemble_std
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  save_to_file: true
+  log_filename: logs_coarse_to_fine/pipeline_{timestamp}.log
+reproducibility:
+  random_seed: 42
+  save_random_state: true
+  track_versions: true
