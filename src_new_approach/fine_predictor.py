@@ -21,6 +21,17 @@ from src_new_approach.utils_downscaling import (
     print_statistics
 )
 
+# PyTorch support for scale-consistent NN
+try:
+    import torch
+    from src_new_approach.scale_consistent_nn import (
+        ScaleConsistentNNWrapper,
+        ScaleConsistentTrainer
+    )
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
 
 class FinePredictor:
     """
@@ -42,6 +53,7 @@ class FinePredictor:
         self.models_dir = Path(models_dir)
         self.models = {}
         self.scalers = {}
+        self.feature_info = {}  # Store feature indices for scale-consistent models
         self.ensemble_info = None
         
         print(f"🔧 Fine Predictor initialized:")
@@ -59,9 +71,10 @@ class FinePredictor:
         print("\n📂 Loading trained models...")
         
         if model_names is None:
-            # Find all model files
+            # Find all model files (both .joblib and .pt)
             model_files = list(self.models_dir.glob("*_coarse_model.joblib"))
-            model_names = [f.stem.replace('_coarse_model', '') for f in model_files]
+            model_files += list(self.models_dir.glob("*_coarse_model.pt"))
+            model_names = list(set([f.stem.replace('_coarse_model', '') for f in model_files]))
         
         if not model_names:
             raise FileNotFoundError(f"No models found in {self.models_dir}")
@@ -69,10 +82,59 @@ class FinePredictor:
         print(f"   Found {len(model_names)} models: {model_names}")
         
         for model_name in model_names:
-            # Load model
-            model_path = self.models_dir / f"{model_name}_coarse_model.joblib"
-            if model_path.exists():
-                self.models[model_name] = joblib.load(model_path)
+            # Check for PyTorch model first (scale-consistent NN)
+            pt_model_path = self.models_dir / f"{model_name}_coarse_model.pt"
+            joblib_model_path = self.models_dir / f"{model_name}_coarse_model.joblib"
+            
+            if pt_model_path.exists() and HAS_TORCH:
+                # Load PyTorch model
+                print(f"   Loading PyTorch model: {model_name}")
+                
+                # We need to get input_dim from the saved model
+                # Create wrapper and load
+                model = ScaleConsistentNNWrapper()
+                model.config = self.config
+                
+                # Load checkpoint to get config
+                checkpoint = torch.load(pt_model_path, map_location='cpu')
+                input_dim = checkpoint['config'].get('input_dim', None)
+                
+                # If input_dim not in config, try to infer from model state
+                if input_dim is None:
+                    # Get first layer weight shape
+                    for key in checkpoint['model_state_dict']:
+                        if 'weight' in key and '.0.' in key:  # First linear layer
+                            input_dim = checkpoint['model_state_dict'][key].shape[1]
+                            break
+                
+                if input_dim is None:
+                    print(f"   ⚠️ Could not determine input dimension for {model_name}")
+                    # Try to load with joblib fallback
+                    if joblib_model_path.exists():
+                        self.models[model_name] = joblib.load(joblib_model_path)
+                        print(f"   ✓ Loaded {model_name} (joblib fallback)")
+                    continue
+                
+                # Initialize trainer and load
+                model.trainer = ScaleConsistentTrainer(self.config)
+                model.trainer.load(str(pt_model_path), input_dim)
+                model._is_fitted = True
+                
+                self.models[model_name] = model
+                self.scalers[model_name] = None  # Scaling handled internally
+                
+                # Load feature info if exists (for feature subsetting)
+                feature_info_path = self.models_dir / f"{model_name}_feature_info.joblib"
+                if feature_info_path.exists():
+                    self.feature_info[model_name] = joblib.load(feature_info_path)
+                    n_features = len(self.feature_info[model_name]['common_feature_indices'])
+                    print(f"     ✓ Loaded feature info ({n_features} common features)")
+                
+                print(f"   ✓ Loaded {model_name} (PyTorch)")
+                
+            elif joblib_model_path.exists():
+                # Load standard sklearn model
+                self.models[model_name] = joblib.load(joblib_model_path)
                 print(f"   ✓ Loaded {model_name}")
                 
                 # Load scaler if exists
@@ -83,7 +145,7 @@ class FinePredictor:
                 else:
                     self.scalers[model_name] = None
             else:
-                print(f"   ⚠️ Model file not found: {model_path}")
+                print(f"   ⚠️ Model file not found: {model_name}")
         
         # Load ensemble info if available
         ensemble_path = self.models_dir / "ensemble_info.joblib"
@@ -284,9 +346,17 @@ class FinePredictor:
         predictions = np.full(len(X), np.nan)
         
         # Get valid samples
-        X_valid = X[valid_mask]
+        X_valid = X[valid_mask].copy()
         
-        # Scale if needed
+        # Replace any remaining NaN with 0 (should be rare after valid_mask)
+        X_valid = np.nan_to_num(X_valid, nan=0.0)
+        
+        # For scale-consistent models, subset features if feature_info exists
+        if model_name in self.feature_info:
+            feature_indices = self.feature_info[model_name]['common_feature_indices']
+            X_valid = X_valid[:, feature_indices]
+        
+        # Scale if needed (not for scale-consistent NN which handles internally)
         if scaler is not None:
             X_valid = scaler.transform(X_valid)
         

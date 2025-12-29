@@ -69,6 +69,7 @@ from src_new_approach.fine_predictor import FinePredictor
 from src_new_approach.residual_corrector import ResidualCorrector
 from src_new_approach.hyperparameter_tuner import OptunaTuner
 from src_new_approach.shap_analyzer import SHAPAnalyzer
+from src_new_approach.generate_fine_derived_features import generate_fine_derived_features
 
 
 def run_gap_filling(config: dict, logger) -> bool:
@@ -322,6 +323,48 @@ def run_tuning(config: dict, logger) -> bool:
         return False
 
 
+def run_fine_feature_engineering(config: dict, logger) -> bool:
+    """Step 2.6: Generate derived features at fine resolution for scale-consistent training."""
+    logger.info("="*70)
+    logger.info("STEP 2.6: FINE-RESOLUTION FEATURE ENGINEERING")
+    logger.info("="*70)
+    
+    try:
+        # Check if scale-consistent NN is enabled
+        enabled_models = get_config_value(config, 'models.enabled', [])
+        
+        if 'nn_scale_consistent' not in enabled_models:
+            logger.info("⏭️ Scale-consistent NN not enabled - skipping fine feature engineering")
+            return True
+        
+        # Check if output already exists
+        output_path = get_config_value(config, 'paths.feature_stack_fine_all',
+                                       'processed_coarse_to_fine/feature_stack_all_5km.nc')
+        
+        if Path(output_path).exists():
+            logger.info(f"✅ Enhanced fine features already exist: {output_path}")
+            logger.info("   Skipping generation (delete file to regenerate)")
+            return True
+        
+        logger.info("🔧 Generating derived features at 5km resolution...")
+        logger.info("   This enables using all 96 features for scale-consistent training")
+        
+        # Generate features
+        enhanced_ds = generate_fine_derived_features(config, output_path)
+        
+        logger.info(f"✅ Generated {len(enhanced_ds.feature)} temporal + {len(enhanced_ds.static_feature)} static features")
+        enhanced_ds.close()
+        
+        logger.info("✅ Fine feature engineering completed successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Fine feature engineering failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+
 def run_training(config: dict, logger) -> bool:
     """Step 3: Train models at coarse scale with blocked CV or simple split."""
     logger.info("="*70)
@@ -330,6 +373,7 @@ def run_training(config: dict, logger) -> bool:
     
     try:
         features_coarse_path = get_config_value(config, 'paths.feature_stack_coarse')
+        features_fine_path = get_config_value(config, 'paths.feature_stack_fine')
         grace_filled_path = get_config_value(config, 'paths.grace_filled')
         models_dir = get_config_value(config, 'paths.models')
         
@@ -364,6 +408,36 @@ def run_training(config: dict, logger) -> bool:
             else:
                 logger.warning("⚠️ Tuning enabled but no tuned parameters found - using defaults")
                 logger.warning(f"   Searched in: {tuned_params_path}")
+        
+        # Check if scale-consistent NN is enabled - load fine data if so
+        enabled_models = get_config_value(config, 'models.enabled', [])
+        if 'nn_scale_consistent' in enabled_models:
+            logger.info("🧠 Scale-consistent NN enabled - loading fine features...")
+            
+            # Prefer enhanced features (with all derived features) if available
+            features_fine_all_path = get_config_value(config, 'paths.feature_stack_fine_all', 
+                                                       features_fine_path.replace('.nc', '_all.nc'))
+            
+            if Path(features_fine_all_path).exists():
+                logger.info(f"   ✓ Using enhanced fine features: {features_fine_all_path}")
+                fine_features_ds = xr.open_dataset(features_fine_all_path)
+            elif Path(features_fine_path).exists():
+                logger.info(f"   Using basic fine features: {features_fine_path}")
+                logger.info("   💡 Run: python src_new_approach/generate_fine_derived_features.py")
+                logger.info("      to generate enhanced features with anomalies, lags, etc.")
+                fine_features_ds = xr.open_dataset(features_fine_path)
+            else:
+                logger.warning(f"⚠️ Fine features not found")
+                logger.warning("   Scale-consistent NN will train without consistency loss")
+                fine_features_ds = None
+            
+            if fine_features_ds is not None:
+                trainer.set_fine_data_for_scale_consistent(
+                    fine_features_ds,
+                    features_ds,  # coarse features
+                    grace_ds
+                )
+                fine_features_ds.close()
         
         # Prepare data
         X, y, feature_names, metadata = trainer.prepare_training_data(features_ds, grace_ds)
@@ -557,7 +631,7 @@ def main():
         '--steps',
         type=str,
         default='all',
-        help='Steps to run: gap_fill, aggregate, tune, train, predict, correct, validate, all'
+        help='Steps to run: gap_fill, aggregate, tune, fine_features, train, predict, correct, validate, all'
     )
     
     parser.add_argument(
@@ -624,7 +698,7 @@ def main():
     
     # Parse steps
     if args.steps.lower() == 'all':
-        steps = ['create_features', 'gap_fill', 'aggregate', 'tune', 'train', 'predict', 'correct', 'validate']
+        steps = ['create_features', 'gap_fill', 'aggregate', 'tune', 'fine_features', 'train', 'predict', 'correct', 'validate']
     else:
         steps = [s.strip().lower() for s in args.steps.split(',')]
     
@@ -643,6 +717,7 @@ def main():
         'gap_fill': lambda: run_gap_filling(config, logger),
         'aggregate': lambda: run_aggregation(config, logger),
         'tune': lambda: run_tuning(config, logger),
+        'fine_features': lambda: run_fine_feature_engineering(config, logger),
         'train': lambda: run_training(config, logger),
         'predict': lambda: run_fine_prediction(config, logger),
         'correct': lambda: run_residual_correction(config, logger),

@@ -1,5 +1,6 @@
 paths:
   feature_stack_fine: processed_coarse_to_fine/feature_stack_5km.nc
+  feature_stack_fine_all: processed_coarse_to_fine/feature_stack_all_5km.nc  # Fine features with all derived features
   grace_raw: data/raw/grace
   processed_data: processed_coarse_to_fine
   feature_stack_coarse: processed_coarse_to_fine/feature_stack_55km.nc
@@ -86,9 +87,7 @@ feature_aggregation:
   chunk_size: 50
 models:
   enabled:
-  - xgb
-  - lgb
-  - nn
+  - nn_scale_consistent
   ensemble:
     method: weighted
     weight_metric: cv_r2
@@ -161,6 +160,24 @@ models:
       learning_rate_init: 0.001
       batch_size: 1024
       random_state: 42
+    nn_scale_consistent:
+      # Scale-consistent neural network with custom dual-scale loss
+      # L_total = L_pred + lambda_consistency * L_cons
+      # where L_cons ensures aggregated fine predictions match GRACE
+      hidden_layers:
+      - 512
+      - 256
+      - 128
+      learning_rate: 0.001
+      batch_size: 1024
+      max_epochs: 2000
+      early_stopping_patience: 50
+      lambda_consistency: 1.0  # Weight for consistency loss
+      dropout: 0.1
+      weight_decay: 0.0001
+      lr_scheduler_patience: 20
+      lr_scheduler_factor: 0.5
+      activation: relu  # Options: relu, leaky_relu, elu
 residual_correction:
   enabled: true
   calculate_at_scale: 55

@@ -41,6 +41,18 @@ try:
 except ImportError:
     HAS_CATB = False
 
+# Scale-consistent neural network (with fallback)
+try:
+    import torch
+    from src_new_approach.scale_consistent_nn import (
+        ScaleConsistentNNWrapper,
+        ScaleConsistentTrainer,
+        create_coarse_to_fine_mapping
+    )
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
 # Spatiotemporal CV
 from src_new_approach.spatiotemporal_cv import (
     BlockedSpatiotemporalCV,
@@ -88,8 +100,15 @@ class CoarseModelTrainer:
             available_models.append('lgb')
         if HAS_CATB:
             available_models.append('catb')
+        if HAS_TORCH:
+            available_models.append('nn_scale_consistent')
         
         self.enabled_models = [m for m in self.enabled_models if m in available_models]
+        
+        # Store fine data for scale-consistent training (set later if needed)
+        self.fine_features_ds = None
+        self.coarse_to_fine_mapping = None
+        self.fine_valid_mask = None
         
         # Get actual CV method from config
         cv_method = get_config_value(config, 'models.cross_validation.method', 'blocked_spatiotemporal')
@@ -363,17 +382,176 @@ class CoarseModelTrainer:
             return lgb.LGBMRegressor, hyper_config
         elif model_name == 'catb' and HAS_CATB:
             return cb.CatBoostRegressor, hyper_config
+        elif model_name == 'nn_scale_consistent' and HAS_TORCH:
+            # Scale-consistent neural network with custom loss
+            # Returns wrapper class that provides sklearn-compatible interface
+            return ScaleConsistentNNWrapper, hyper_config
         else:
             raise ValueError(f"Model {model_name} not available")
     
     def needs_scaling(self, model_name: str) -> bool:
         """Check if model needs feature scaling."""
+        # nn_scale_consistent handles its own scaling internally
+        if model_name == 'nn_scale_consistent':
+            return False
+        
         models_needing_scaling = get_config_value(
             self.config,
             'models.scaling.models_needing_scaling',
             ['nn', 'svr']
         )
         return model_name in models_needing_scaling
+    
+    def set_fine_data_for_scale_consistent(self, 
+                                           fine_features_ds: xr.Dataset,
+                                           coarse_features_ds: xr.Dataset,
+                                           grace_ds: xr.Dataset):
+        """
+        Set fine-resolution data required for scale-consistent NN training.
+        
+        This method prepares the coarse-to-fine mapping and fine features
+        that are needed for the consistency loss computation.
+        
+        IMPORTANT: Fine features may have fewer features than coarse (which includes
+        derived features like anomalies, lags, etc.). This method identifies the
+        common features and stores indices for subsetting coarse features during training.
+        
+        Parameters:
+        -----------
+        fine_features_ds : xr.Dataset
+            Fine resolution (5km) feature dataset
+        coarse_features_ds : xr.Dataset
+            Coarse resolution (55km) feature dataset
+        grace_ds : xr.Dataset
+            GRACE dataset (for coordinate reference)
+        """
+        if not HAS_TORCH:
+            print("⚠️ PyTorch not available - cannot use scale-consistent NN")
+            return
+        
+        print("\n" + "="*70)
+        print("📦 PREPARING FINE DATA FOR SCALE-CONSISTENT TRAINING")
+        print("="*70)
+        
+        # Get coordinates
+        coarse_lat = coarse_features_ds.lat.values
+        coarse_lon = coarse_features_ds.lon.values
+        fine_lat = fine_features_ds.lat.values
+        fine_lon = fine_features_ds.lon.values
+        n_times = len(coarse_features_ds.time)
+        
+        aggregation_factor = get_config_value(self.config, 'resolution.aggregation_factor', 11)
+        
+        print(f"   Coarse grid: {len(coarse_lat)} × {len(coarse_lon)}")
+        print(f"   Fine grid: {len(fine_lat)} × {len(fine_lon)}")
+        print(f"   Time steps: {n_times}")
+        print(f"   Aggregation factor: {aggregation_factor}")
+        
+        # Get feature names from both datasets
+        fine_temporal_names = list(fine_features_ds.feature.values) if 'feature' in fine_features_ds.coords else []
+        fine_static_names = list(fine_features_ds.static_feature.values) if 'static_feature' in fine_features_ds.coords else []
+        coarse_temporal_names = list(coarse_features_ds.feature.values) if 'feature' in coarse_features_ds.coords else []
+        coarse_static_names = list(coarse_features_ds.static_feature.values) if 'static_feature' in coarse_features_ds.coords else []
+        
+        # Combine feature names (temporal + static)
+        fine_all_names = [str(n) for n in fine_temporal_names] + [str(n) for n in fine_static_names]
+        coarse_all_names = [str(n) for n in coarse_temporal_names] + [str(n) for n in coarse_static_names]
+        
+        print(f"\n📊 Feature comparison:")
+        print(f"   Coarse features: {len(coarse_all_names)} ({len(coarse_temporal_names)} temporal + {len(coarse_static_names)} static)")
+        print(f"   Fine features: {len(fine_all_names)} ({len(fine_temporal_names)} temporal + {len(fine_static_names)} static)")
+        
+        # Find common features (features that exist in both datasets)
+        # For scale-consistent training, we need features available at both scales
+        common_features = []
+        coarse_indices = []
+        fine_indices = []
+        
+        for i, fname in enumerate(coarse_all_names):
+            if fname in fine_all_names:
+                common_features.append(fname)
+                coarse_indices.append(i)
+                fine_indices.append(fine_all_names.index(fname))
+        
+        print(f"   Common features: {len(common_features)}")
+        
+        if len(common_features) < len(fine_all_names):
+            print(f"   ⚠️ Some fine features not in coarse: {set(fine_all_names) - set(common_features)}")
+        
+        if len(common_features) < len(coarse_all_names):
+            print(f"   ⚠️ Some coarse features not in fine: {set(coarse_all_names) - set(common_features)}")
+        
+        # Store indices for subsetting features during training
+        self.common_feature_indices = np.array(coarse_indices)
+        self.fine_feature_indices = np.array(fine_indices)  # Also store fine indices!
+        self.common_feature_names = common_features
+        
+        # Create coarse-to-fine mapping
+        self.coarse_to_fine_mapping, fine_cell_counts = create_coarse_to_fine_mapping(
+            coarse_lat, coarse_lon,
+            fine_lat, fine_lon,
+            n_times,
+            aggregation_factor
+        )
+        
+        # Prepare fine features (same format as coarse)
+        print("\n🔄 Preparing fine features...")
+        
+        # Extract features from fine dataset
+        if 'features' in fine_features_ds and 'static_features' in fine_features_ds:
+            # Stacked format with separate temporal and static features
+            temporal_features = fine_features_ds['features'].values  # (time, feature, lat, lon)
+            static_features = fine_features_ds['static_features'].values  # (static_feature, lat, lon)
+            
+            # Transpose temporal features to (time, lat, lon, feature)
+            temporal_features = temporal_features.transpose(0, 2, 3, 1)
+            
+            # Broadcast static features across time
+            static_broadcasted = np.broadcast_to(
+                static_features[np.newaxis, :, :, :],
+                (n_times,) + static_features.shape
+            ).transpose(0, 2, 3, 1)  # (time, lat, lon, static_feature)
+            
+            # Combine
+            fine_feature_data = np.concatenate([temporal_features, static_broadcasted], axis=-1)
+            
+        elif 'features' in fine_features_ds:
+            # Old stacked format
+            fine_feature_data = fine_features_ds['features'].values
+            if fine_feature_data.shape[1] != len(fine_lat):
+                # Shape is (time, feature, lat, lon), transpose to (time, lat, lon, feature)
+                fine_feature_data = fine_feature_data.transpose(0, 2, 3, 1)
+        else:
+            raise ValueError("Fine features dataset format not recognized")
+        
+        n_times_fine, n_lat_fine, n_lon_fine, n_features = fine_feature_data.shape
+        
+        # Flatten to (n_samples, n_features)
+        X_fine_full = fine_feature_data.reshape(-1, n_features)
+        
+        # IMPORTANT: Subset fine features to ONLY the common features
+        # This ensures fine and coarse have the same feature set
+        X_fine_common = X_fine_full[:, self.fine_feature_indices]
+        
+        print(f"   Fine features subsetted: {n_features} → {X_fine_common.shape[1]} (common)")
+        
+        # Track valid samples - use a threshold instead of requiring all features valid
+        # Lag features have NaN at the beginning, which is expected
+        nan_counts = np.sum(np.isnan(X_fine_common), axis=1)
+        max_nan_allowed = X_fine_common.shape[1] * 0.1  # Allow up to 10% NaN
+        self.fine_valid_mask = nan_counts <= max_nan_allowed
+        
+        # For samples with some NaN, replace with 0 (the mask tracks validity)
+        X_fine_common = np.nan_to_num(X_fine_common, nan=0.0)
+        
+        self.X_fine = X_fine_common.astype(np.float32)
+        self.fine_features_ds = fine_features_ds
+        
+        n_fine_valid = np.sum(self.fine_valid_mask)
+        print(f"   Fine samples: {len(self.X_fine):,} total, {n_fine_valid:,} valid ({100*n_fine_valid/len(self.X_fine):.1f}%)")
+        print(f"   Fine features shape: {self.X_fine.shape}")
+        print(f"\n✅ Fine data prepared for scale-consistent training")
+        print(f"   🎯 Model will use {len(common_features)} common features at both scales")
     
     def train_with_blocked_cv(self,
                              X: np.ndarray,
@@ -548,47 +726,110 @@ class CoarseModelTrainer:
                 needs_scale = self.needs_scaling(model_name)
                 
                 print(f"   Model class: {model_class.__name__}")
-                print(f"   Scaling: {'Yes' if needs_scale else 'No'}")
+                print(f"   Scaling: {'Yes' if needs_scale else 'No (handled internally)' if model_name == 'nn_scale_consistent' else 'No'}")
                 print(f"   Hyperparameters: {len(model_params)} configured")
                 
-                # Initialize model
-                model = model_class(**model_params)
-                
-                # Prepare training data (with scaling if needed)
-                X_train_scaled = X_train.copy()
-                X_test_scaled = X_test.copy()
-                scaler = None
-                
-                if needs_scale:
-                    print(f"   Applying feature scaling...")
-                    scaling_method = get_config_value(
-                        self.config, 'models.scaling.method', 'robust'
-                    )
+                # Special handling for scale-consistent neural network
+                if model_name == 'nn_scale_consistent':
+                    # Check if fine data is available
+                    if self.X_fine is None or self.coarse_to_fine_mapping is None:
+                        print("   ⚠️ Fine data not set - training without consistency loss")
+                        print("   💡 Call set_fine_data_for_scale_consistent() before training for full benefits")
                     
-                    if scaling_method == 'robust':
-                        scaler = RobustScaler()
+                    # Subset coarse features to only use common features (available at both scales)
+                    if hasattr(self, 'common_feature_indices') and self.common_feature_indices is not None:
+                        X_common = X[:, self.common_feature_indices]
+                        print(f"   📐 Using {len(self.common_feature_indices)} common features (subset of {X.shape[1]})")
+                        print(f"      Features: {self.common_feature_names[:5]}... (and {len(self.common_feature_names)-5} more)")
                     else:
-                        scaler = StandardScaler()
+                        X_common = X
+                        print(f"   📐 Using all {X.shape[1]} features (no common feature subset defined)")
                     
-                    X_train_scaled = scaler.fit_transform(X_train)
-                    X_test_scaled = scaler.transform(X_test)
+                    # Initialize model with config
+                    model = model_class(**model_params)
+                    model.config = self.config
                     
-                    # Store scaler
-                    self.scalers[model_name] = scaler
-                
-                # Train the model
-                print(f"   Training {model_name.upper()}...")
-                model.fit(X_train_scaled, y_train)
-                
-                # Make predictions
-                y_train_pred = model.predict(X_train_scaled)
-                y_test_pred = model.predict(X_test_scaled)
-                
-                # Calculate metrics
-                train_r2 = r2_score(y_train, y_train_pred)
-                test_r2 = r2_score(y_test, y_test_pred)
-                test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
-                test_mae = mean_absolute_error(y_test, y_test_pred)
+                    # Set fine data if available
+                    if self.X_fine is not None and self.coarse_to_fine_mapping is not None:
+                        model.set_fine_data(
+                            self.X_fine,
+                            self.coarse_to_fine_mapping,
+                            self.fine_valid_mask
+                        )
+                    
+                    # Train the model (it handles train/val split internally)
+                    print(f"   Training {model_name.upper()} with scale-consistent loss...")
+                    model.fit(X_common, y)  # Use common features - model handles its own split
+                    
+                    # Store feature indices for prediction
+                    self.scale_consistent_feature_indices = self.common_feature_indices if hasattr(self, 'common_feature_indices') else None
+                    
+                    # Make predictions for metrics
+                    y_pred = model.predict(X_common)
+                    
+                    # Calculate metrics on full data (model already validated internally)
+                    train_r2 = r2_score(y, y_pred)
+                    test_r2 = train_r2  # For scale-consistent, use internal validation
+                    test_rmse = np.sqrt(mean_squared_error(y, y_pred))
+                    test_mae = mean_absolute_error(y, y_pred)
+                    
+                    # Get internal validation metrics if available
+                    if hasattr(model, 'trainer') and model.trainer is not None:
+                        if model.trainer.history['val_loss']:
+                            # Approximate R² from final validation loss
+                            # MSE = variance * (1 - R²) => R² ≈ 1 - MSE/variance
+                            val_mse = model.trainer.history['val_loss_pred'][-1]
+                            y_var = np.var(y)
+                            if y_var > 0:
+                                test_r2 = max(0, 1 - val_mse / y_var)
+                    
+                    # Store the trained model
+                    self.models[model_name] = model
+                    self.scalers[model_name] = None  # Scaling handled internally
+                    
+                else:
+                    # Standard model training
+                    # Initialize model
+                    model = model_class(**model_params)
+                    
+                    # Prepare training data (with scaling if needed)
+                    X_train_scaled = X_train.copy()
+                    X_test_scaled = X_test.copy()
+                    scaler = None
+                    
+                    if needs_scale:
+                        print(f"   Applying feature scaling...")
+                        scaling_method = get_config_value(
+                            self.config, 'models.scaling.method', 'robust'
+                        )
+                        
+                        if scaling_method == 'robust':
+                            scaler = RobustScaler()
+                        else:
+                            scaler = StandardScaler()
+                        
+                        X_train_scaled = scaler.fit_transform(X_train)
+                        X_test_scaled = scaler.transform(X_test)
+                        
+                        # Store scaler
+                        self.scalers[model_name] = scaler
+                    
+                    # Train the model
+                    print(f"   Training {model_name.upper()}...")
+                    model.fit(X_train_scaled, y_train)
+                    
+                    # Make predictions
+                    y_train_pred = model.predict(X_train_scaled)
+                    y_test_pred = model.predict(X_test_scaled)
+                    
+                    # Calculate metrics
+                    train_r2 = r2_score(y_train, y_train_pred)
+                    test_r2 = r2_score(y_test, y_test_pred)
+                    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+                    test_mae = mean_absolute_error(y_test, y_test_pred)
+                    
+                    # Store the trained model
+                    self.models[model_name] = model
                 
                 # Store results (similar to CV format for compatibility)
                 result_row = {
@@ -603,9 +844,6 @@ class CoarseModelTrainer:
                 # Store CV results for compatibility
                 cv_results_df = pd.DataFrame([result_row])
                 self.cv_results[model_name] = cv_results_df
-                
-                # Store the trained model
-                self.models[model_name] = model
                 
                 # Create summary
                 summary = {
@@ -818,12 +1056,33 @@ class CoarseModelTrainer:
         
         # Save each model
         for model_name, model in self.models.items():
-            model_path = output_dir / f"{model_name}_coarse_model.joblib"
-            joblib.dump(model, model_path)
-            print(f"✓ Saved {model_name}: {model_path}")
+            # Handle scale-consistent NN separately (PyTorch model)
+            if model_name == 'nn_scale_consistent' and HAS_TORCH:
+                model_path = output_dir / f"{model_name}_coarse_model.pt"
+                if hasattr(model, 'save'):
+                    model.save(str(model_path))
+                else:
+                    # Fallback: save with joblib
+                    joblib.dump(model, output_dir / f"{model_name}_coarse_model.joblib")
+                print(f"✓ Saved {model_name}: {model_path}")
+                
+                # Save feature indices for scale-consistent model
+                if hasattr(self, 'common_feature_indices') and self.common_feature_indices is not None:
+                    feature_info = {
+                        'common_feature_indices': self.common_feature_indices,
+                        'common_feature_names': self.common_feature_names if hasattr(self, 'common_feature_names') else None
+                    }
+                    feature_info_path = output_dir / f"{model_name}_feature_info.joblib"
+                    joblib.dump(feature_info, feature_info_path)
+                    print(f"✓ Saved {model_name} feature info: {feature_info_path}")
+            else:
+                # Standard sklearn model
+                model_path = output_dir / f"{model_name}_coarse_model.joblib"
+                joblib.dump(model, model_path)
+                print(f"✓ Saved {model_name}: {model_path}")
             
-            # Save scaler if exists
-            if self.scalers.get(model_name) is not None:
+            # Save scaler if exists (not for scale-consistent NN which handles internally)
+            if model_name != 'nn_scale_consistent' and self.scalers.get(model_name) is not None:
                 scaler_path = output_dir / f"{model_name}_scaler.joblib"
                 joblib.dump(self.scalers[model_name], scaler_path)
                 print(f"✓ Saved {model_name} scaler: {scaler_path}")
