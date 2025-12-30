@@ -54,7 +54,126 @@ class FeatureAggregator:
         print(f"🔧 Feature Aggregator initialized:")
         print(f"   Aggregation factor: {self.aggregation_factor}x (55km / 5km)")
         print(f"   Mask by GRACE coverage: {self.mask_by_grace}")
-    
+        
+        # Initialize baseline anomaly settings
+        self.baseline_anomaly_enabled = get_config_value(
+            config, 'baseline_anomaly.enabled', False
+        )
+        if self.baseline_anomaly_enabled:
+            self.baseline_period = get_config_value(
+                config, 'baseline_anomaly.reference_period', 
+                {'start': '2004-01', 'end': '2009-12'}
+            )
+            self.anomaly_variables = get_config_value(
+                config, 'baseline_anomaly.variables.water_balance',
+                ['chirps', 'ET_mm_month', 'SWE_inst', 'SoilMoi0_7cm_inst', 'SoilMoi7_28cm_inst', 'SoilMoi28_100cm_inst', 'SoilMoi100_289cm_inst']
+            )
+            print(f"🌊 Baseline anomaly calculation enabled:")
+            print(f"   Reference period: {self.baseline_period['start']} to {self.baseline_period['end']}")
+            print(f"   Variables: {len(self.anomaly_variables)} water-balance variables")
+
+    def calculate_baseline_anomalies(self, feature_data: np.ndarray, feature_names: list, 
+                                   target_times: pd.DatetimeIndex) -> tuple:
+        """
+        Calculate baseline period anomalies for water-balance variables.
+        
+        Transforms variables to anomaly space: anomaly = value - mean(2004-2009)
+        This matches GRACE's anomaly representation.
+        
+        Parameters:
+        -----------
+        feature_data : np.ndarray
+            Feature data array (time, features, lat, lon)
+        feature_names : list
+            List of feature names
+        target_times : pd.DatetimeIndex
+            Time coordinate for the data
+            
+        Returns:
+        --------
+        tuple
+            (anomaly_data, anomaly_names) - transformed data and updated names
+        """
+        if not self.baseline_anomaly_enabled:
+            return feature_data, feature_names
+            
+        print(f"\n🌊 CALCULATING BASELINE ANOMALIES")
+        print("="*50)
+        
+        # Parse baseline period
+        baseline_start = pd.to_datetime(self.baseline_period['start'] + '-01')
+        baseline_end = pd.to_datetime(self.baseline_period['end'] + '-01') + pd.DateOffset(months=1) - pd.Timedelta(days=1)
+        
+        print(f"Baseline period: {baseline_start.strftime('%Y-%m')} to {baseline_end.strftime('%Y-%m')}")
+        
+        # Find baseline period indices
+        baseline_mask = (target_times >= baseline_start) & (target_times <= baseline_end)
+        baseline_indices = np.where(baseline_mask)[0]
+        
+        if len(baseline_indices) == 0:
+            print("⚠️ Warning: No data found in baseline period, skipping anomaly calculation")
+            return feature_data, feature_names
+        
+        print(f"Baseline indices: {len(baseline_indices)} months out of {len(target_times)} total")
+        
+        # Create copy for anomaly calculation
+        anomaly_data = feature_data.copy()
+        anomaly_names = feature_names.copy()
+        
+        # Calculate anomalies for each water-balance variable
+        variables_processed = 0
+        for i, feature_name in enumerate(feature_names):
+            # Check if this variable should be converted to anomaly
+            is_anomaly_variable = any(var in str(feature_name) for var in self.anomaly_variables)
+            
+            if is_anomaly_variable:
+                print(f"   Processing {feature_name}...")
+                
+                # Extract feature data (time, lat, lon)
+                var_data = feature_data[:, i, :, :]
+                
+                # Calculate baseline mean for each grid cell
+                baseline_data = var_data[baseline_indices, :, :]  # (baseline_times, lat, lon)
+                baseline_mean = np.nanmean(baseline_data, axis=0)  # (lat, lon)
+                
+                # Check for valid baseline data
+                valid_pixels = ~np.isnan(baseline_mean)
+                n_valid = np.sum(valid_pixels)
+                total_pixels = baseline_mean.size
+                
+                print(f"     Baseline coverage: {n_valid}/{total_pixels} pixels ({100*n_valid/total_pixels:.1f}%)")
+                
+                if n_valid == 0:
+                    print(f"     ⚠️ Warning: No valid baseline data for {feature_name}")
+                    continue
+                
+                # Calculate anomalies: value - baseline_mean
+                anomaly_values = var_data - baseline_mean[np.newaxis, :, :]
+                
+                # Update the data
+                anomaly_data[:, i, :, :] = anomaly_values
+                
+                # Update variable name to indicate anomaly
+                if not feature_name.endswith('_anom'):
+                    anomaly_names[i] = f"{feature_name}_anom"
+                
+                # Validate anomaly calculation
+                baseline_anomaly_check = anomaly_values[baseline_indices, :, :]
+                baseline_anomaly_mean = np.nanmean(baseline_anomaly_check)
+                baseline_anomaly_std = np.nanstd(baseline_anomaly_check)
+                
+                print(f"     ✅ Anomaly calculated: mean={baseline_anomaly_mean:.4f}, std={baseline_anomaly_std:.4f}")
+                variables_processed += 1
+            else:
+                print(f"   Skipping {feature_name} (not in anomaly variable list)")
+        
+        print(f"\n✅ Baseline anomaly calculation complete!")
+        print(f"   Variables processed: {variables_processed}/{len(self.anomaly_variables)} requested")
+        print(f"   Baseline period: {len(baseline_indices)} months")
+        print(f"   Method: value - baseline_mean")
+        
+        return anomaly_data, anomaly_names
+
     def load_fine_features(self, features_path: str) -> xr.Dataset:
         """
         Load high-resolution feature stack and extend to full temporal coverage.
@@ -202,14 +321,20 @@ class FeatureAggregator:
         
         # Define data sources and their patterns
         data_sources = {
-            'gldas': {
-                'path': 'data/raw/gldas',
-                'variables': ['Evap_tavg', 'SWE_inst', 'SoilMoi0_10cm_inst', 'SoilMoi10_40cm_inst', 'SoilMoi100_200cm_inst'],
-                'file_pattern': 'numeric'  # 0.tif, 1.tif, etc.
+            'mod16_et': {
+                'path': 'data/raw/mod16_et',
+                'variables': ['ET_mm_month'],
+                'file_pattern': 'numeric',  # 0.tif, 1.tif, etc.
+                'is_direct': True
+            },
+            'era5_land': {
+                'path': 'data/raw/era5_land',
+                'variables': ['SoilMoi0_7cm_inst', 'SoilMoi7_28cm_inst', 'SoilMoi28_100cm_inst', 'SoilMoi100_289cm_inst', 'SWE_inst'],
+                'file_pattern': 'numeric'
             },
             'terraclimate': {
                 'path': 'data/raw/terraclimate', 
-                'variables': ['aet', 'def', 'pr', 'tmmn', 'tmmx'],  # Load tmmn, tmmx to calculate tmean
+                'variables': ['def', 'tmmn', 'tmmx'],  # Removed 'aet' and 'pr' (replaced by MOD16 and CHIRPS)
                 'file_pattern': 'yyyymm'
             },
             'chirps': {
@@ -431,6 +556,12 @@ class FeatureAggregator:
             print(f"   ✅ Replaced tmmn+tmmx with tmean")
         else:
             print("⚠️ Could not calculate tmean - missing tmmn or tmmx data")
+        
+        # Apply baseline anomaly calculation if enabled
+        if self.baseline_anomaly_enabled:
+            feature_data, feature_names = self.calculate_baseline_anomalies(
+                feature_data, feature_names, target_times_pd
+            )
         
         # Load static features directly from raw data
         static_data, static_names = self._load_static_features_from_raw(height, width, lat_coords, lon_coords)

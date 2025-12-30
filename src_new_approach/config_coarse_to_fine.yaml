@@ -59,11 +59,10 @@ feature_aggregation:
   aggregation_methods:
     mean:
     - SoilMoi.*
-    - Evap_tavg
-    - pr
+    - ET_mm_month
+    - chirps
     - tmmn
     - tmmx
-    - aet
     - def
     - SWE_inst
     - elevation
@@ -72,7 +71,7 @@ feature_aggregation:
     - curvature
     - topo_.*
     - .*_mean
-    - .*_anomaly
+    - .*_anom
     - population_density
     - soil_.*
     - sand_.*
@@ -200,6 +199,26 @@ data_processing:
   reference_period:
     start: 2004-01
     end: 2009-12
+    
+baseline_anomaly:
+  enabled: true
+  reference_period:
+    start: '2004-01'
+    end: '2009-12'
+  variables:
+    water_balance: 
+      - 'chirps'
+      - 'ET_mm_month'
+      - 'SWE_inst'
+      - 'SoilMoi0_7cm_inst'
+      - 'SoilMoi7_28cm_inst'
+      - 'SoilMoi28_100cm_inst'
+      - 'SoilMoi100_289cm_inst'
+    optional:
+      - 'tmean'
+      - 'def'
+  method: 'absolute'  # value - baseline_mean (not relative)
+  description: 'Convert water-balance variables to anomalies relative to 2004-2009 baseline to match GRACE anomaly representation'
   grace_valid_range:
   - -100
   - 100
