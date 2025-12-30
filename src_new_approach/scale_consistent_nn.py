@@ -38,74 +38,109 @@ warnings.filterwarnings('ignore')
 
 class ScaleConsistentMLP(nn.Module):
     """
-    Multi-Layer Perceptron for scale-consistent TWS prediction.
+    Improved Multi-Layer Perceptron for scale-consistent TWS prediction.
     
-    Architecture matches the original sklearn MLPRegressor but implemented
-    in PyTorch to enable custom loss functions.
+    Key improvements over standard MLP:
+    - Residual connections for better gradient flow
+    - LayerNorm instead of BatchNorm for stability
+    - SiLU (Swish) activation for smoother gradients
+    - Designed to handle dual-scale (coarse/fine) prediction
     """
     
     def __init__(self, 
                  input_dim: int,
-                 hidden_layers: List[int] = [512, 256, 128],
-                 dropout: float = 0.1,
-                 activation: str = 'relu'):
+                 hidden_layers: List[int] = [256, 256, 128],
+                 dropout: float = 0.2,
+                 activation: str = 'silu',
+                 use_residual: bool = True):
         """
-        Initialize the MLP.
+        Initialize the improved MLP.
         
         Parameters:
         -----------
         input_dim : int
             Number of input features
         hidden_layers : List[int]
-            Sizes of hidden layers (default: [512, 256, 128])
+            Sizes of hidden layers (default: [256, 256, 128])
         dropout : float
-            Dropout rate between layers (default: 0.1)
+            Dropout rate between layers (default: 0.2)
         activation : str
-            Activation function ('relu', 'leaky_relu', 'elu')
+            Activation function ('silu', 'gelu', 'relu', 'leaky_relu', 'elu')
+        use_residual : bool
+            Whether to use residual connections (default: True)
         """
         super(ScaleConsistentMLP, self).__init__()
         
         self.input_dim = input_dim
         self.hidden_layers = hidden_layers
+        self.use_residual = use_residual
         
-        # Build network layers
-        layers = []
-        prev_dim = input_dim
+        # Select activation function
+        self.activation = self._get_activation(activation)
         
-        for i, hidden_dim in enumerate(hidden_layers):
-            # Linear layer
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            
-            # Batch normalization for stability
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            
-            # Activation
-            if activation == 'relu':
-                layers.append(nn.ReLU())
-            elif activation == 'leaky_relu':
-                layers.append(nn.LeakyReLU(0.1))
-            elif activation == 'elu':
-                layers.append(nn.ELU())
-            else:
-                layers.append(nn.ReLU())
-            
-            # Dropout
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            
-            prev_dim = hidden_dim
+        # Input projection layer
+        self.input_proj = nn.Linear(input_dim, hidden_layers[0])
+        self.input_norm = nn.LayerNorm(hidden_layers[0])
         
-        # Output layer (single output for TWS prediction)
-        layers.append(nn.Linear(prev_dim, 1))
+        # Residual projection for input (if dimensions don't match)
+        if use_residual:
+            self.input_residual = nn.Linear(input_dim, hidden_layers[0])
         
-        self.network = nn.Sequential(*layers)
+        # Hidden layers with residual connections
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+        
+        for i in range(len(hidden_layers) - 1):
+            in_dim = hidden_layers[i]
+            out_dim = hidden_layers[i + 1]
+            
+            # Main layer
+            self.layers.append(nn.Linear(in_dim, out_dim))
+            self.norms.append(nn.LayerNorm(out_dim))
+            
+            # Residual projection (if dimensions don't match)
+            if use_residual:
+                if in_dim != out_dim:
+                    self.residuals.append(nn.Linear(in_dim, out_dim))
+                else:
+                    self.residuals.append(nn.Identity())
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+        # Output layer
+        self.output = nn.Linear(hidden_layers[-1], 1)
         
         # Initialize weights
         self._init_weights()
+        
+        # Print architecture info
+        print(f"🏗️ ScaleConsistentMLP Architecture:")
+        print(f"   Input: {input_dim}")
+        print(f"   Hidden: {' → '.join(map(str, hidden_layers))}")
+        print(f"   Output: 1")
+        print(f"   Activation: {activation.upper()}")
+        print(f"   Normalization: LayerNorm")
+        print(f"   Residual connections: {use_residual}")
+        print(f"   Dropout: {dropout}")
+    
+    def _get_activation(self, name: str) -> nn.Module:
+        """Get activation function by name."""
+        activations = {
+            'silu': nn.SiLU(),      # Swish: x * sigmoid(x)
+            'swish': nn.SiLU(),
+            'gelu': nn.GELU(),      # Gaussian Error Linear Unit
+            'relu': nn.ReLU(),
+            'leaky_relu': nn.LeakyReLU(0.1),
+            'elu': nn.ELU(),
+            'mish': nn.Mish(),      # x * tanh(softplus(x))
+        }
+        return activations.get(name.lower(), nn.SiLU())
     
     def _init_weights(self):
-        """Initialize weights using Xavier initialization."""
-        for module in self.network.modules():
+        """Initialize weights using Xavier/Glorot initialization."""
+        for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
@@ -113,7 +148,7 @@ class ScaleConsistentMLP(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass with residual connections.
         
         Parameters:
         -----------
@@ -125,8 +160,30 @@ class ScaleConsistentMLP(nn.Module):
         torch.Tensor
             Predictions of shape (batch_size,)
         """
-        output = self.network(x)
-        return output.squeeze(-1)  # Remove last dimension
+        # Input layer with residual
+        h = self.input_proj(x)
+        h = self.input_norm(h)
+        h = self.activation(h)
+        
+        if self.use_residual:
+            h = h + self.input_residual(x)
+        
+        h = self.dropout(h)
+        
+        # Hidden layers with residuals
+        for layer, norm, residual in zip(self.layers, self.norms, self.residuals):
+            h_new = layer(h)
+            h_new = norm(h_new)
+            h_new = self.activation(h_new)
+            
+            if self.use_residual:
+                h_new = h_new + residual(h)
+            
+            h = self.dropout(h_new)
+        
+        # Output
+        output = self.output(h)
+        return output.squeeze(-1)
     
     def predict(self, x: np.ndarray) -> np.ndarray:
         """
@@ -582,13 +639,17 @@ class ScaleConsistentTrainer:
     def _get_hyperparams(self) -> Dict:
         """Get hyperparameters from config."""
         default_params = {
-            'hidden_layers': [512, 256, 128],
+            # Architecture
+            'hidden_layers': [256, 256, 128],  # Improved: gentler reduction with residuals
+            'activation': 'silu',              # SiLU (Swish) for smoother gradients
+            'use_residual': True,              # Residual connections for better gradient flow
+            'dropout': 0.2,                    # Increased for better regularization
+            # Training
             'learning_rate': 0.001,
             'batch_size': 1024,
             'max_epochs': 2000,
             'early_stopping_patience': 50,
-            'lambda_consistency': 1.0,
-            'dropout': 0.1,
+            'lambda_consistency': 0.1,         # Default: soft consistency constraint
             'weight_decay': 0.0001,
             'lr_scheduler_patience': 20,
             'lr_scheduler_factor': 0.5
@@ -608,7 +669,7 @@ class ScaleConsistentTrainer:
                     X_fine: np.ndarray,
                     coarse_to_fine_mapping: List[List[int]],
                     fine_valid_mask: Optional[np.ndarray] = None,
-                    train_fraction: float = 0.7,
+                    train_fraction: float = 0.9,  # 90% train, 10% validation (matches sklearn)
                     random_state: int = 42) -> Tuple[DataLoader, DataLoader]:
         """
         Prepare training and validation data loaders.
@@ -713,7 +774,9 @@ class ScaleConsistentTrainer:
         self.model = ScaleConsistentMLP(
             input_dim=input_dim,
             hidden_layers=params['hidden_layers'],
-            dropout=params['dropout']
+            dropout=params['dropout'],
+            activation=params.get('activation', 'silu'),
+            use_residual=params.get('use_residual', True)
         ).to(self.device)
         
         self.optimizer = optim.Adam(
@@ -900,7 +963,7 @@ class ScaleConsistentTrainer:
             X_fine: np.ndarray,
             coarse_to_fine_mapping: List[List[int]],
             fine_valid_mask: Optional[np.ndarray] = None,
-            train_fraction: float = 0.7,
+            train_fraction: float = 0.9,  # 90% train, 10% validation (matches sklearn)
             random_state: int = 42,
             verbose: bool = True) -> Dict:
         """
@@ -955,15 +1018,19 @@ class ScaleConsistentTrainer:
         best_model_state = None
         epochs_without_improvement = 0
         
+        # Determine if we should use consistency loss (skip if lambda=0)
+        use_consistency = params['lambda_consistency'] > 0
+        
         print(f"\n🏃 Starting training for up to {max_epochs} epochs...")
         print(f"   Early stopping patience: {patience}")
+        print(f"   Consistency loss: {'ENABLED' if use_consistency else 'DISABLED (λ=0, fast mode)'}")
         
         for epoch in range(max_epochs):
             # Train
-            train_metrics = self.train_epoch(train_loader, use_consistency=True)
+            train_metrics = self.train_epoch(train_loader, use_consistency=use_consistency)
             
             # Validate
-            val_metrics = self.validate(val_loader, use_consistency=True)
+            val_metrics = self.validate(val_loader, use_consistency=use_consistency)
             
             # Update learning rate
             self.scheduler.step(val_metrics['loss'])

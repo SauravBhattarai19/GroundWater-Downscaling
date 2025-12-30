@@ -391,15 +391,12 @@ def run_training(config: dict, logger) -> bool:
         # Check if we should load tuned parameters
         tuning_enabled = get_config_value(config, 'hyperparameter_tuning.enabled', False)
         if tuning_enabled:
-            # Always check original models directory first (where tuning saves parameters)
-            # This is the base directory without any _simple suffix
-            cv_method = get_config_value(config, 'models.cross_validation.method', 'blocked_spatiotemporal')
-            if cv_method == 'simple_split':
-                # For simple split, look in the original directory (without _simple suffix)
-                original_models_dir = models_dir.replace('_simple', '')
-                tuned_params_path = Path(original_models_dir) / "tuned_hyperparameters.yaml"
-            else:
-                # For blocked CV, check current models directory
+            # Look for tuned params in the config's models directory (without _simple suffix added by pipeline)
+            config_models_dir = get_config_value(config, 'paths.models', 'models_coarse_to_fine')
+            tuned_params_path = Path(config_models_dir) / "tuned_hyperparameters.yaml"
+            
+            # Also check current models_dir if not found
+            if not tuned_params_path.exists():
                 tuned_params_path = Path(models_dir) / "tuned_hyperparameters.yaml"
             
             if tuned_params_path.exists():

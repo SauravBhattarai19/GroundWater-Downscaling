@@ -164,20 +164,26 @@ models:
       # Scale-consistent neural network with custom dual-scale loss
       # L_total = L_pred + lambda_consistency * L_cons
       # where L_cons ensures aggregated fine predictions match GRACE
+      #
+      # IMPROVED ARCHITECTURE:
+      # - Residual connections for better gradient flow
+      # - LayerNorm instead of BatchNorm
+      # - SiLU (Swish) activation for smoother gradients
       hidden_layers:
-      - 512
+      - 256
       - 256
       - 128
       learning_rate: 0.001
       batch_size: 1024
       max_epochs: 2000
       early_stopping_patience: 50
-      lambda_consistency: 1.0  # Weight for consistency loss
-      dropout: 0.1
+      lambda_consistency: 0.0  # Weight for consistency loss (0 = baseline test for new architecture)
+      dropout: 0.2             # Increased from 0.1 for better regularization
       weight_decay: 0.0001
       lr_scheduler_patience: 20
       lr_scheduler_factor: 0.5
-      activation: relu  # Options: relu, leaky_relu, elu
+      activation: silu         # Options: silu, gelu, relu, leaky_relu, elu, mish
+      use_residual: true       # Enable residual connections
 residual_correction:
   enabled: true
   calculate_at_scale: 55
