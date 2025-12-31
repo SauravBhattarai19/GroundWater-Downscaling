@@ -50,9 +50,10 @@ class ScaleConsistentMLP(nn.Module):
     def __init__(self, 
                  input_dim: int,
                  hidden_layers: List[int] = [256, 256, 128],
-                 dropout: float = 0.2,
+                 dropout: float = 0.1,
                  activation: str = 'silu',
-                 use_residual: bool = True):
+                 use_residual: bool = True,
+                 normalization: str = 'layernorm'):
         """
         Initialize the improved MLP.
         
@@ -63,33 +64,37 @@ class ScaleConsistentMLP(nn.Module):
         hidden_layers : List[int]
             Sizes of hidden layers (default: [256, 256, 128])
         dropout : float
-            Dropout rate between layers (default: 0.2)
+            Dropout rate between layers (default: 0.1)
         activation : str
             Activation function ('silu', 'gelu', 'relu', 'leaky_relu', 'elu')
         use_residual : bool
             Whether to use residual connections (default: True)
+        normalization : str
+            Normalization type ('batchnorm', 'layernorm', 'none')
         """
         super(ScaleConsistentMLP, self).__init__()
         
         self.input_dim = input_dim
         self.hidden_layers = hidden_layers
         self.use_residual = use_residual
+        self.normalization = normalization.lower()
         
         # Select activation function
         self.activation = self._get_activation(activation)
         
         # Input projection layer
         self.input_proj = nn.Linear(input_dim, hidden_layers[0])
-        self.input_norm = nn.LayerNorm(hidden_layers[0])
+        self.input_norm = self._get_normalization(hidden_layers[0])
         
         # Residual projection for input (if dimensions don't match)
         if use_residual:
             self.input_residual = nn.Linear(input_dim, hidden_layers[0])
         
-        # Hidden layers with residual connections
+        # Hidden layers
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.residuals = nn.ModuleList()
+        if use_residual:
+            self.residuals = nn.ModuleList()
         
         for i in range(len(hidden_layers) - 1):
             in_dim = hidden_layers[i]
@@ -97,9 +102,9 @@ class ScaleConsistentMLP(nn.Module):
             
             # Main layer
             self.layers.append(nn.Linear(in_dim, out_dim))
-            self.norms.append(nn.LayerNorm(out_dim))
+            self.norms.append(self._get_normalization(out_dim))
             
-            # Residual projection (if dimensions don't match)
+            # Residual projection (only if using residuals)
             if use_residual:
                 if in_dim != out_dim:
                     self.residuals.append(nn.Linear(in_dim, out_dim))
@@ -121,7 +126,7 @@ class ScaleConsistentMLP(nn.Module):
         print(f"   Hidden: {' → '.join(map(str, hidden_layers))}")
         print(f"   Output: 1")
         print(f"   Activation: {activation.upper()}")
-        print(f"   Normalization: LayerNorm")
+        print(f"   Normalization: {normalization.upper()}")
         print(f"   Residual connections: {use_residual}")
         print(f"   Dropout: {dropout}")
     
@@ -137,6 +142,18 @@ class ScaleConsistentMLP(nn.Module):
             'mish': nn.Mish(),      # x * tanh(softplus(x))
         }
         return activations.get(name.lower(), nn.SiLU())
+    
+    def _get_normalization(self, num_features: int) -> nn.Module:
+        """Get normalization layer by type."""
+        if self.normalization == 'batchnorm':
+            return nn.BatchNorm1d(num_features)
+        elif self.normalization == 'layernorm':
+            return nn.LayerNorm(num_features)
+        elif self.normalization == 'none':
+            return nn.Identity()
+        else:
+            # Default to LayerNorm for unknown types
+            return nn.LayerNorm(num_features)
     
     def _init_weights(self):
         """Initialize weights using Xavier/Glorot initialization."""
@@ -170,16 +187,22 @@ class ScaleConsistentMLP(nn.Module):
         
         h = self.dropout(h)
         
-        # Hidden layers with residuals
-        for layer, norm, residual in zip(self.layers, self.norms, self.residuals):
-            h_new = layer(h)
-            h_new = norm(h_new)
-            h_new = self.activation(h_new)
-            
-            if self.use_residual:
+        # Hidden layers
+        if self.use_residual:
+            # With residual connections
+            for layer, norm, residual in zip(self.layers, self.norms, self.residuals):
+                h_new = layer(h)
+                h_new = norm(h_new)
+                h_new = self.activation(h_new)
                 h_new = h_new + residual(h)
-            
-            h = self.dropout(h_new)
+                h = self.dropout(h_new)
+        else:
+            # Without residual connections
+            for layer, norm in zip(self.layers, self.norms):
+                h = layer(h)
+                h = norm(h)
+                h = self.activation(h)
+                h = self.dropout(h)
         
         # Output
         output = self.output(h)
@@ -643,7 +666,8 @@ class ScaleConsistentTrainer:
             'hidden_layers': [256, 256, 128],  # Improved: gentler reduction with residuals
             'activation': 'silu',              # SiLU (Swish) for smoother gradients
             'use_residual': True,              # Residual connections for better gradient flow
-            'dropout': 0.2,                    # Increased for better regularization
+            'normalization': 'layernorm',      # LayerNorm by default
+            'dropout': 0.1,                    # Increased for better regularization
             # Training
             'learning_rate': 0.001,
             'batch_size': 1024,
@@ -776,7 +800,8 @@ class ScaleConsistentTrainer:
             hidden_layers=params['hidden_layers'],
             dropout=params['dropout'],
             activation=params.get('activation', 'silu'),
-            use_residual=params.get('use_residual', True)
+            use_residual=params.get('use_residual', True),
+            normalization=params.get('normalization', 'layernorm')
         ).to(self.device)
         
         self.optimizer = optim.Adam(

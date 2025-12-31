@@ -170,7 +170,7 @@ models:
       # - LayerNorm instead of BatchNorm
       # - SiLU (Swish) activation for smoother gradients
       hidden_layers:
-      - 256
+      - 512
       - 256
       - 128
       learning_rate: 0.001
@@ -178,12 +178,13 @@ models:
       max_epochs: 2000
       early_stopping_patience: 50
       lambda_consistency: 0.0  # Weight for consistency loss (0 = baseline test for new architecture)
-      dropout: 0.2             # Increased from 0.1 for better regularization
+      dropout: 0.15            # Potential improvement: wider + slight modern touches
       weight_decay: 0.0001
       lr_scheduler_patience: 20
       lr_scheduler_factor: 0.5
-      activation: silu         # Options: silu, gelu, relu, leaky_relu, elu, mish
-      use_residual: true       # Enable residual connections
+      activation: leaky_relu   # Avoids dead neurons, still sparse-ish
+      use_residual: false      # Potential improvement: wider + slight modern touches
+      normalization: batchnorm # Options: 'batchnorm', 'layernorm', 'none'
 residual_correction:
   enabled: true
   calculate_at_scale: 55
